@@ -73,10 +73,16 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 exit 0
 endef
 
-define Package/luci-app-drcom/postrm
+# 停止服务必须放在 prerm：postrm 执行时文件已经删掉了，/etc/init.d/drcom 不存在
+define Package/luci-app-drcom/prerm
 #!/bin/sh
 /etc/init.d/drcom stop
 /etc/init.d/drcom disable
+exit 0
+endef
+
+define Package/luci-app-drcom/postrm
+#!/bin/sh
 /etc/init.d/rpcd restart
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 exit 0
