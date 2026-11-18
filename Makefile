@@ -20,6 +20,11 @@ PKG_MAINTAINER:=ht65
 
 include $(INCLUDE_DIR)/package.mk
 
+# 纯文件包，没有任何编译动作；不覆盖默认实现的话
+# 构建系统会在空的 build 目录里执行 make 并报 "No targets specified"
+define Build/Compile
+endef
+
 define Package/luci-app-drcom
   SECTION:=luci
   CATEGORY:=LuCI
