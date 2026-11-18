@@ -1,0 +1,55 @@
+name: build-apk
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载 SDK
+        run: |
+          set -euo pipefail
+          URL="https://downloads.immortalwrt.org/releases/25.12.2/targets/mediatek/filogic/immortalwrt-sdk-25.12.2-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+          echo "::group::下载 $URL"
+          wget -q "$URL" -O sdk.tar.zst
+          ls -lh sdk.tar.zst
+          mkdir -p sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+          rm -f sdk.tar.zst
+          echo "::endgroup::"
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          mkdir -p sdk/package/luci-app-drcom
+          cp -r root Makefile sdk/package/luci-app-drcom/
+          cd sdk
+          make defconfig
+          make package/luci-app-drcom/compile V=s -j"$(nproc)"
+
+      - name: 检查产物
+        run: |
+          set -euo pipefail
+          find sdk/bin/packages -name '*.apk' -type f -print
+          test -n "$(find sdk/bin/packages -name '*.apk' -type f -print -quit)"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-drcom-apk
+          path: sdk/bin/packages/**/*.apk
+          if-no-files-found: error
+
+      - name: 附加到 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sdk/bin/packages/**/*.apk

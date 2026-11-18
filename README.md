@@ -51,26 +51,37 @@ sh install.sh
 
 已存在的 `/etc/config/drcom` 不会被覆盖，升级不会丢账号。
 
-### 方式二：用 SDK 编译成 apk
+### 方式二：安装 apk（推荐给想用包管理器的）
 
-ImmortalWrt 25.12 起包管理器是 apk-tools 3，安装包是带签名的 v3 格式（二进制 ADB 容器），只能由 SDK 产出，手工打包不可行。
+ImmortalWrt 25.12 起包管理器换成了 apk-tools 3，安装包是带签名的 v3 格式（二进制 ADB 容器），只能在 Linux 环境用 SDK 编译产出，手工打包不可行。
 
-```sh
-# 下载与固件同版本的 SDK，解压后
-cp -r luci-app-drcom package/
-make package/luci-app-drcom/compile V=s
-# 产物：bin/packages/*/base/luci-app-drcom-1.0.0-r1.apk
-```
-
-本仓库的 `Makefile` 基于 `luci.mk`，依赖 `luci-base`。装的时候：
+本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-1.0.0-r1.apk`，然后在路由器上：
 
 ```sh
 apk add --allow-untrusted ./luci-app-drcom-1.0.0-r1.apk
 ```
 
-（自行编译的包没有官方密钥签名，所以要加 `--allow-untrusted`。）
+用 apk 安装的好处是：它会正常出现在 LuCI 的「软件包」列表里，也能用 `apk del luci-app-drcom` 卸载。
 
-LuCI 的「软件包」页面上传安装时执行的是 `apk add /tmp/upload.apk`，**不带** `--allow-untrusted`，所以自己编译的包在那里会报 `UNTRUSTED signature`。要么用命令行装，要么把签名公钥放进 `/etc/apk/keys/` 后再装。
+注意两点：
+
+- 自行构建的包没有官方密钥签名，**必须**加 `--allow-untrusted`。
+- LuCI「软件包」页面上传安装时执行的是 `apk add /tmp/upload.apk`，**不带**这个参数，所以在那里会报 `UNTRUSTED signature`。请用命令行安装，或先把签名公钥放进 `/etc/apk/keys/`。
+
+### 方式三：自己用 SDK 编译
+
+需要一台 Linux 机器（或 WSL / Docker）：
+
+```sh
+# 下载与固件同版本的 SDK，解压后把本仓库放进 package/
+cp -r luci-app-drcom <sdk>/package/
+cd <sdk>
+make defconfig
+make package/luci-app-drcom/compile V=s
+# 产物：bin/packages/*/base/luci-app-drcom-1.0.0-r1.apk
+```
+
+`Makefile` 不依赖 luci feed，只依赖 `rpcd`，包架构为 `all`。
 
 ## 配置项
 

@@ -1,8 +1,14 @@
 #
 # luci-app-drcom —— Dr.COM 校园网 Portal 认证
 #
-# 该 Makefile 用于在 OpenWrt / ImmortalWrt SDK 中编译出正式安装包（.apk）。
-# 使用步骤见 README 的「用 SDK 编译安装包」一节。
+# 不依赖 luci feed，可直接在 OpenWrt / ImmortalWrt SDK 中编译：
+#
+#   cp -r luci-app-drcom <sdk>/package/
+#   cd <sdk>
+#   make defconfig
+#   make package/luci-app-drcom/compile V=s
+#
+# 产物位于 <sdk>/bin/packages/*/base/luci-app-drcom-*.apk
 #
 include $(TOPDIR)/rules.mk
 
@@ -10,11 +16,45 @@ PKG_NAME:=luci-app-drcom
 PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
+PKG_MAINTAINER:=ht65
 
-LUCI_TITLE:=Dr.COM 校园网 Portal 认证
-LUCI_DEPENDS:=+rpcd
-LUCI_PKGARCH:=all
+include $(INCLUDE_DIR)/package.mk
 
+define Package/luci-app-drcom
+  SECTION:=luci
+  CATEGORY:=LuCI
+  SUBMENU:=3. Applications
+  TITLE:=Dr.COM 校园网 Portal 认证
+  DEPENDS:=+rpcd
+  PKGARCH:=all
+endef
+
+define Package/luci-app-drcom/description
+  路由器自动完成 Dr.COM（城市热点）校园网 Portal 认证，供接入本机的设备
+  共享上网。带 LuCI 图形界面，支持断线自动重连与手动上下线。
+endef
+
+define Package/luci-app-drcom/install
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DIR) $(1)/usr/share/drcom
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/drcom
+
+	$(INSTALL_BIN)  ./root/etc/init.d/drcom                        $(1)/etc/init.d/drcom
+	$(INSTALL_BIN)  ./root/etc/hotplug.d/iface/95-drcom            $(1)/etc/hotplug.d/iface/95-drcom
+	$(INSTALL_BIN)  ./root/usr/sbin/drcom-portal                   $(1)/usr/sbin/drcom-portal
+	$(INSTALL_BIN)  ./root/usr/libexec/rpcd/drcom                  $(1)/usr/libexec/rpcd/drcom
+	$(INSTALL_DATA) ./root/usr/share/drcom/config.default          $(1)/usr/share/drcom/config.default
+	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-drcom.json     $(1)/usr/share/luci/menu.d/luci-app-drcom.json
+	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-drcom.json      $(1)/usr/share/rpcd/acl.d/luci-app-drcom.json
+	$(INSTALL_DATA) ./root/www/luci-static/resources/view/drcom/overview.js $(1)/www/luci-static/resources/view/drcom/overview.js
+endef
+
+# 只首次生成配置，升级时保留用户已填的账号密码
 define Package/luci-app-drcom/postinst
 #!/bin/sh
 [ -f /etc/config/drcom ] || {
@@ -37,6 +77,4 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 exit 0
 endef
 
-include $(TOPDIR)/feeds/luci/luci.mk
-
-# call BuildPackage - OpenWrt buildroot signature
+$(eval $(call BuildPackage,luci-app-drcom))
