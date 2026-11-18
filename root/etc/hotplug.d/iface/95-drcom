@@ -1,0 +1,8 @@
+#!/bin/sh
+# 上行接口（有线 wan / 无线中继 wwan）重新拨起时，立刻重新走一遍认证
+
+[ "$ACTION" = "ifup" ] || exit 0
+
+case "$INTERFACE" in
+	wan|wwan) /etc/init.d/drcom restart ;;
+esac

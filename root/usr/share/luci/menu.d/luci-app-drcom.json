@@ -1,0 +1,22 @@
+{
+	"admin/services/drcom": {
+		"title": "Dr.COM 认证",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-drcom" ],
+			"uci": { "drcom": true }
+		}
+	},
+
+	"admin/services/drcom/overview": {
+		"title": "认证设置",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "drcom/overview"
+		}
+	}
+}

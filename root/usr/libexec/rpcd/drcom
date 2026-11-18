@@ -1,0 +1,82 @@
+#!/bin/sh
+# luci-app-drcom 的 rpcd 后端：向 LuCI 界面提供状态与操作接口
+. /usr/share/libubox/jshn.sh
+
+STATE=/var/run/drcom/state
+
+cfg() { uci -q get "drcom.main.$1"; }
+
+method_status() {
+	local running=0 online=0 paused=0 ip="" uplink="" account="" stamp=0 age=-1 port ser term configured=0
+
+	pgrep -f "drcom-portal watch" >/dev/null 2>&1 && running=1
+
+	[ -f "$STATE" ] && . "$STATE"
+	[ -n "$stamp" ] && [ "$stamp" -gt 0 ] 2>/dev/null && age=$(( $(date +%s) - stamp ))
+
+	port=$(cfg portal_port)
+	ser=$(cat /var/run/drcom/server 2>/dev/null)
+	term=$(cfg terminal_type)
+	[ -n "$(cfg username)" ] && [ -n "$(cfg password)" ] && configured=1
+
+	json_init
+	json_add_int    running    "$running"
+	json_add_int    online     "$online"
+	json_add_int    paused     "${paused:-0}"
+	json_add_int    configured "$configured"
+	json_add_string ip         "$ip"
+	json_add_string uplink     "$uplink"
+	json_add_string account    "$account"
+	json_add_string server     "$ser"
+	json_add_string port       "$port"
+	json_add_string terminal   "$term"
+	json_add_int    age        "$age"
+	json_add_int    enabled    "$(cfg enabled)"
+	json_dump
+}
+
+method_log() {
+	logread -e drcom 2>/dev/null | tail -n 80 > /tmp/.drcom-log.$$
+	json_init
+	json_add_array lines
+	while IFS= read -r line; do
+		json_add_string "" "$line"
+	done < /tmp/.drcom-log.$$
+	json_close_array
+	rm -f /tmp/.drcom-log.$$
+	json_dump
+}
+
+method_action() {
+	local out
+	case "$1" in
+		online)  out=$(/usr/sbin/drcom-portal online 2>&1) ;;
+		offline) out=$(/usr/sbin/drcom-portal offline 2>&1) ;;
+		restart) /etc/init.d/drcom restart >/dev/null 2>&1; out="认证服务已重启" ;;
+	esac
+	json_init
+	json_add_string message "$out"
+	json_dump
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object status;  json_close_object
+		json_add_object log;     json_close_object
+		json_add_object online;  json_close_object
+		json_add_object offline; json_close_object
+		json_add_object restart; json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			status)  method_status ;;
+			log)     method_log ;;
+			online)  method_action online ;;
+			offline) method_action offline ;;
+			restart) method_action restart ;;
+			*) json_init; json_add_string message "unknown method"; json_dump ;;
+		esac
+		;;
+esac

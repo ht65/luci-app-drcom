@@ -1,0 +1,27 @@
+config drcom 'main'
+	option enabled '1'
+
+	# 校园网账号密码，装好后在 LuCI 界面「服务 -> Dr.COM 认证」里填写
+	option username ''
+	option password ''
+
+	# 运营商后缀：校园移动 / 校园用户留空，电信填 @dx，联通填 @lt
+	option carrier ''
+
+	# 终端类型：0-未知 1-PC 2-手机 3-平板(横屏) 4-平板(竖屏)
+	option terminal_type '1'
+
+	# 认证服务器（默认值对应重庆财经职业学院，其他学校请自行修改）
+	# portal_host 只用于打开认证页取服务器地址，portal_ip 是取不到时的兜底
+	option portal_host 'login.cqcfe.com'
+	option portal_ip '172.22.44.46'
+	option portal_port '801'
+
+	# 上行接口：auto 自动在无线中继(wwan) / 有线(wan) 中挑选已获取 IP 的那个
+	option uplink 'auto'
+
+	# 在线检测间隔 / 认证失败重试间隔（秒）
+	option check_interval '60'
+	option retry_interval '20'
+	option probe_url 'http://www.msftconnecttest.com/connecttest.txt'
+	option probe_expect 'Microsoft Connect Test'

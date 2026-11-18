@@ -1,0 +1,34 @@
+#!/bin/sh
+# luci-app-drcom 卸载脚本（在路由器上执行）
+#
+#   sh uninstall.sh
+#
+# 默认保留 /etc/config/drcom；要一并删除请加 --purge
+
+set -e
+
+echo "==> 停止服务"
+/etc/init.d/drcom stop >/dev/null 2>&1 || true
+/etc/init.d/drcom disable >/dev/null 2>&1 || true
+
+echo "==> 删除文件"
+rm -f /etc/init.d/drcom \
+      /etc/hotplug.d/iface/95-drcom \
+      /usr/sbin/drcom-portal \
+      /usr/libexec/rpcd/drcom \
+      /usr/share/luci/menu.d/luci-app-drcom.json \
+      /usr/share/rpcd/acl.d/luci-app-drcom.json \
+      /www/luci-static/resources/view/drcom/overview.js
+rm -rf /www/luci-static/resources/view/drcom /usr/share/drcom
+
+if [ "$1" = "--purge" ]; then
+	echo "==> 删除配置"
+	rm -f /etc/config/drcom
+fi
+
+echo "==> 刷新 rpcd 与 LuCI 缓存"
+/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+
+echo ""
+echo "卸载完成。"

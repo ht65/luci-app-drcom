@@ -1,0 +1,303 @@
+#!/bin/sh
+# Dr.COM ePortal (城市热点) 网页认证客户端
+#
+# 用于让路由器代替接入设备完成校园网 Portal 认证。
+# 用法: drcom-portal {online|offline|login|status|watch}
+
+. /lib/functions.sh
+
+STATE_DIR=/var/run/drcom
+PAUSE_FILE="$STATE_DIR/paused"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+log() { echo "$(date '+%F %T') $*"; }
+err() { echo "$(date '+%F %T') ERROR: $*" >&2; }
+
+load_config() {
+	config_load drcom
+	config_get_bool ENABLED        main enabled           1
+	config_get      USERNAME       main username          ""
+	config_get      PASSWORD       main password          ""
+	config_get      CARRIER        main carrier           ""
+	config_get      PORTAL_HOST    main portal_host "login.cqcfe.com"
+	config_get      PORTAL_IP      main portal_ip   "172.22.44.46"
+	config_get      PORTAL_PORT    main portal_port       "801"
+	config_get      UPLINK         main uplink            "auto"
+	config_get      TERMINAL_TYPE  main terminal_type     "1"
+	config_get      CHECK_INTERVAL main check_interval    "60"
+	config_get      RETRY_INTERVAL main retry_interval    "20"
+	config_get      PROBE_URL      main probe_url "http://www.msftconnecttest.com/connecttest.txt"
+	config_get      PROBE_EXPECT   main probe_expect "Microsoft Connect Test"
+	ACCOUNT="$USERNAME$CARRIER"
+	# 0-未知 1-PC 2-手机 3-平板(横屏) 4-平板(竖屏)，决定上报的终端类型
+	case "$TERMINAL_TYPE" in
+		0|1|2|3|4) ;;
+		*) TERMINAL_TYPE=1 ;;
+	esac
+}
+
+# 写入状态快照供 LuCI 界面秒读，避免每次开页面都要等探测超时
+save_state() {
+	mkdir -p "$STATE_DIR"
+	{
+		echo "online=$1"
+		echo "ip='$2'"
+		echo "uplink='$3'"
+		echo "account='$ACCOUNT'"
+		if [ -f "$PAUSE_FILE" ]; then echo "paused=1"; else echo "paused=0"; fi
+		echo "stamp=$(date +%s)"
+	} > "$STATE_DIR/state.tmp" 2>/dev/null
+	mv "$STATE_DIR/state.tmp" "$STATE_DIR/state" 2>/dev/null
+}
+
+urlencode() {
+	local s="$1" out="" c i=0 n=${#1}
+	while [ $i -lt $n ]; do
+		c=${s:$i:1}
+		case "$c" in
+			[A-Za-z0-9._~-]) out="$out$c" ;;
+			*) out="$out$(printf '%%%02X' "'$c")" ;;
+		esac
+		i=$((i+1))
+	done
+	printf '%s' "$out"
+}
+
+iface_ip() {
+	ubus call network.interface."$1" status 2>/dev/null | \
+		jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null
+}
+
+iface_dev() {
+	ubus call network.interface."$1" status 2>/dev/null | \
+		jsonfilter -e '@.l3_device' 2>/dev/null
+}
+
+# auto: 优先无线中继(wwan)，其次有线(wan)，取第一个拿到 IP 的
+resolve_uplink() {
+	case "$UPLINK" in
+		""|auto)
+			local ifc
+			for ifc in wwan wan; do
+				[ -n "$(iface_ip $ifc)" ] && { echo "$ifc"; return 0; }
+			done
+			echo wwan
+			;;
+		*) echo "$UPLINK" ;;
+	esac
+}
+
+# 认证服务器地址：优先用上次探测结果，其次从认证页取 v4serip
+portal_server() {
+	local cached="$STATE_DIR/server"
+	[ -s "$cached" ] && { cat "$cached"; return 0; }
+
+	local page="$STATE_DIR/page.htm" ser=""
+	wget -q -O "$page" --timeout=8 -U "$UA" \
+		"http://$PORTAL_HOST/a79.htm?url=http://www.msftconnecttest.com/redirect" 2>/dev/null
+	if [ -s "$page" ]; then
+		ser=$(grep -o "v4serip=[^;]*" "$page" 2>/dev/null | head -1 | cut -d= -f2 | tr -d "'\" ")
+	fi
+	[ -z "$ser" ] && ser="$PORTAL_IP"
+	mkdir -p "$STATE_DIR"
+	echo "$ser" > "$cached"
+	echo "$ser"
+}
+
+# 未认证时该地址会被劫持到认证页，只有真正通了才会返回预期内容
+probe_online() {
+	local body
+	body=$(wget -q -O - --timeout=8 "$PROBE_URL" 2>/dev/null | tr -d '\r\n')
+	[ "$body" = "$PROBE_EXPECT" ]
+}
+
+do_login() {
+	[ -n "$ACCOUNT" ] && [ -n "$PASSWORD" ] || { err "账号或密码未配置"; return 2; }
+
+	local up ip dev mac ser resp msg
+	up=$(resolve_uplink)
+	ip=$(iface_ip "$up")
+	[ -z "$ip" ] && { err "上行接口 $up 未获取到 IP，暂不认证"; return 3; }
+
+	dev=$(iface_dev "$up")
+	mac=$(cat /sys/class/net/"$dev"/address 2>/dev/null | tr -d ':' | tr 'A-F' 'a-f')
+	[ -z "$mac" ] && mac=000000000000
+
+	ser=$(portal_server)
+	mkdir -p "$STATE_DIR"
+	resp="$STATE_DIR/login.json"
+
+	wget -q -O "$resp" --timeout=12 -U "$UA" \
+		"http://$ser:$PORTAL_PORT/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,$(urlencode "$ACCOUNT")&user_password=$(urlencode "$PASSWORD")&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.1.3&terminal_type=$TERMINAL_TYPE&lang=zh-cn&v=$(date +%s)" 2>/dev/null
+
+	if [ ! -s "$resp" ]; then
+		# 服务器地址可能已变，清缓存让下次重新探测
+		rm -f "$STATE_DIR/server"
+		err "认证服务器 $ser:$PORTAL_PORT 无响应"
+		return 4
+	fi
+
+	if grep -q '"result":1' "$resp"; then
+		log "认证成功 账号=$ACCOUNT 本机IP=$ip"
+		return 0
+	fi
+
+	msg=$(sed -n 's/.*"msg":"\([^"]*\)".*/\1/p' "$resp" | head -1)
+	[ -z "$msg" ] && msg=$(head -c 120 "$resp")
+	err "认证失败：$msg (账号=$ACCOUNT IP=$ip)"
+	return 1
+}
+
+# 下线本机：暂停自动认证并断开上行。
+# 校园网会话与接入点绑定，断开上行时 AC 会终止本机会话，且只影响这台设备。
+do_offline() {
+	mkdir -p "$STATE_DIR"
+	: > "$PAUSE_FILE"
+	local up
+	up=$(resolve_uplink)
+	log "下线本机：断开上行 $up"
+	ifdown "$up" >/dev/null 2>&1
+	sleep 2
+	save_state 0 "-" "$up"
+}
+
+# 上线本机：拉起上行。控制在 20 秒内返回，避免界面请求超时；
+# 残留的认证工作交给守护循环，它会在下一个周期补上。
+do_online() {
+	rm -f "$PAUSE_FILE"
+	local up ip i=0
+	up=$(resolve_uplink)
+	log "上线本机：拉起上行 $up"
+	ifup "$up" >/dev/null 2>&1
+
+	while [ $i -lt 6 ]; do
+		ip=$(iface_ip "$up")
+		[ -n "$ip" ] && break
+		sleep 2
+		i=$((i+1))
+	done
+
+	if [ -z "$ip" ]; then
+		err "上行 $up 尚未获取到 IP，交由守护继续处理"
+		save_state 0 "-" "$up"
+		return 3
+	fi
+
+	if probe_online; then
+		log "上线完成，无需重新认证"
+		save_state 1 "$ip" "$up"
+	else
+		log "上行已恢复，等待守护完成认证"
+		save_state 0 "$ip" "$up"
+	fi
+
+	return 0
+}
+
+# 清掉暂停标记并立即认证一次
+do_relogin() {
+	rm -f "$PAUSE_FILE"
+	log "重新认证"
+	do_login
+	local up ip
+	up=$(resolve_uplink); ip=$(iface_ip "$up")
+	if probe_online; then save_state 1 "$ip" "$up"; else save_state 0 "$ip" "$up"; fi
+}
+
+do_status() {
+	local up ip
+	up=$(resolve_uplink)
+	ip=$(iface_ip "$up")
+	echo "上行接口: $up"
+	echo "上行地址: ${ip:-未获取}"
+	echo "账号:     ${ACCOUNT:-未配置}"
+	echo "终端类型: $TERMINAL_TYPE"
+	echo "认证服务器: $(portal_server):$PORTAL_PORT"
+	[ -f "$PAUSE_FILE" ] && echo "自动认证: 已暂停"
+	if probe_online; then echo "网络状态: 已认证，可上网"; else echo "网络状态: 未认证/无网络"; fi
+}
+
+watch_loop() {
+	trap 'log "服务停止"; save_state 0 "-" "-"; exit 0' TERM INT
+
+	log "服务启动"
+	while true; do
+		# 每轮重新读配置，界面上改完设置无需重启服务即可生效
+		load_config
+
+		if [ "$ENABLED" != "1" ]; then
+			save_state 0 "-" "-"
+			sleep 60
+			continue
+		fi
+
+		if [ -z "$ACCOUNT" ] || [ -z "$PASSWORD" ]; then
+			save_state 0 "-" "-"
+			sleep 60
+			continue
+		fi
+
+		local up ip
+		up=$(resolve_uplink)
+		ip=$(iface_ip "$up")
+		if [ -z "$ip" ]; then
+			save_state 0 "-" "$up"
+			sleep 10
+			continue
+		fi
+
+		# 用户手动下线后暂停自动认证，直到点「上线」或重启路由器
+		if [ -f "$PAUSE_FILE" ]; then
+			if probe_online; then save_state 1 "$ip" "$up"; else save_state 0 "$ip" "$up"; fi
+			sleep "$RETRY_INTERVAL"
+			continue
+		fi
+
+		if probe_online; then
+			save_state 1 "$ip" "$up"
+			sleep "$CHECK_INTERVAL"
+			continue
+		fi
+
+		# 二次确认，避免瞬时抖动误判
+		sleep 3
+		if probe_online; then
+			save_state 1 "$ip" "$up"
+			sleep "$CHECK_INTERVAL"
+			continue
+		fi
+
+		# 上行 IP 变了就重新探测认证服务器
+		if [ -f "$STATE_DIR/last_ip" ] && [ "$(cat "$STATE_DIR/last_ip")" != "$ip" ]; then
+			rm -f "$STATE_DIR/server"
+		fi
+		echo "$ip" > "$STATE_DIR/last_ip"
+
+		if do_login; then
+			sleep 4
+			if probe_online; then
+				save_state 1 "$ip" "$up"
+				sleep "$CHECK_INTERVAL"
+			else
+				save_state 0 "$ip" "$up"
+				log "认证接口返回成功，但网络仍未通，稍后重试"
+				sleep "$RETRY_INTERVAL"
+			fi
+		else
+			save_state 0 "$ip" "$up"
+			sleep "$RETRY_INTERVAL"
+		fi
+	done
+}
+
+load_config
+mkdir -p "$STATE_DIR"
+
+case "$1" in
+	online)  do_online ;;
+	offline) do_offline ;;
+	login)   do_relogin ;;
+	status)  do_status ;;
+	watch)   watch_loop ;;
+	*) echo "用法: $0 {online|offline|login|status|watch}"; exit 1 ;;
+esac
