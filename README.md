@@ -2,6 +2,8 @@
 
 给 OpenWrt / ImmortalWrt 用的 Dr.COM（城市热点）校园网网页认证插件，带 LuCI 图形界面。
 
+本项目基于 **重庆财经职业学院** 校园网实测开发，认证系统为 Dr.COM ePortal 4.x。本校同学直接用默认配置即可，其他学校需要修改认证门户地址。
+
 路由器代替电脑完成 Portal 认证，接在路由器后面的设备共享同一条已认证的校园网连接，不用每台设备各自登录。
 
 ## 功能
@@ -13,7 +15,14 @@
 
 ## 适合什么环境
 
-认证页形如 `http://<门户>/a79.htm`、接口是 ePortal 4.x 的部署。本项目里实测过的接口：
+### 开发环境
+
+- 校园网：重庆财经职业学院，Dr.COM（城市热点）ePortal 4.x，认证页 `http://login.cqcfe.com/a79.htm`，认证服务器 `172.22.44.46:801`
+- 固件：ImmortalWrt 25.12.2（aarch64），以无线中继方式接入校园网
+
+### 通用判断标准
+
+认证页形如 `http://<门户>/a79.htm`、接口属于 ePortal 4.x 的部署。本项目实测过的接口：
 
 - 登录：`GET http://<服务器>:801/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,<账号>&user_password=<密码>&...`
 - 在线列表：`GET http://<服务器>:801/eportal/portal/online_list?callback=dr1003&user_account=<账号>`
@@ -73,7 +82,7 @@ LuCI 页面里都能改，也可以直接改 `/etc/config/drcom`：
 | `carrier` | 运营商后缀：校园移动/校园用户留空，电信 `@dx`，联通 `@lt` |
 | `terminal_type` | 上报的终端类型：`0`未知 `1`PC `2`手机 `3`平板横屏 `4`平板竖屏 |
 | `uplink` | 上行接口，`auto` 自动在无线中继 `wwan` 和有线 `wan` 之间选已获取 IP 的那个 |
-| `portal_host` / `portal_ip` / `portal_port` | 认证门户。默认值是本项目实测学校的地址，**换学校必须改** |
+| `portal_host` / `portal_ip` / `portal_port` | 认证门户，默认值为重庆财经职业学院的 `login.cqcfe.com` / `172.22.44.46:801`，**换学校必须改** |
 | `check_interval` | 在线检测间隔（秒），越大越省流量，越小掉线恢复越快 |
 | `retry_interval` | 认证失败重试间隔（秒） |
 
