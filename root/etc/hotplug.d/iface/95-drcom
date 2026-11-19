@@ -1,8 +1,8 @@
 #!/bin/sh
-# 上行接口（有线 wan / 无线中继 wwan）重新拨起时，立刻重新走一遍认证
-
+# 上行接口（有线 wan / 无线中继 wwan）重新拨起时，唤醒守护进程立即重新检测。
+# 这里只发信号、不整体重启服务：重启要走 procd 的停机流程，既慢又会打断状态更新。
 [ "$ACTION" = "ifup" ] || exit 0
 
 case "$INTERFACE" in
-	wan|wwan) /etc/init.d/drcom restart ;;
+	wan|wwan) /usr/sbin/drcom-portal wake ;;
 esac

@@ -9,8 +9,46 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 前端语法检查
+        run: node --check root/www/luci-static/resources/view/drcom/overview.js
+
+      - name: Shell 语法检查
+        run: |
+          set -euo pipefail
+          for f in install.sh uninstall.sh \
+                   root/etc/init.d/drcom \
+                   root/etc/hotplug.d/iface/95-drcom \
+                   root/usr/sbin/drcom-portal \
+                   root/usr/libexec/rpcd/drcom; do
+            echo "== $f"
+            sh -n "$f"
+          done
+
+      - name: 检查换行符（必须全是 LF）
+        run: |
+          set -euo pipefail
+          if git ls-files -z | xargs -0 -r grep -lU $'\r'; then
+            echo "::error::发现 CRLF 换行符，路由器上的 ash 会直接报语法错误"
+            exit 1
+          fi
+          echo "全部为 LF"
+
+      - name: 检查 JSON 合法性
+        run: |
+          set -euo pipefail
+          python3 -m json.tool root/usr/share/luci/menu.d/luci-app-drcom.json > /dev/null
+          python3 -m json.tool root/usr/share/rpcd/acl.d/luci-app-drcom.json > /dev/null
+
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -42,13 +80,30 @@ jobs:
           test -n "$(find sdk/bin/packages -name '*.apk' -type f -print -quit)"
 
       - name: 打包 tar.gz 安装包
-        run: python3 tools/build-package.py
+        run: |
+          set -euo pipefail
+          # 用提交时间做 mtime，让产物可复现
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python3 tools/build-package.py
+
+      - name: 生成固定名别名
+        run: |
+          set -euo pipefail
+          # README 里的下载链接指向这两个不带版本号的名字，
+          # 这样发下一版时不用再手动改文档
+          apk="$(find sdk/bin/packages -name '*.apk' -type f -print -quit)"
+          test -n "$apk"
+          mkdir -p dist
+          cp "$apk" dist/luci-app-drcom.apk
+          ls -lh dist
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: luci-app-drcom-apk
-          path: sdk/bin/packages/**/*.apk
+          path: |
+            sdk/bin/packages/**/*.apk
+            dist/*
           if-no-files-found: error
 
       - name: 附加到 Release
@@ -57,4 +112,5 @@ jobs:
         with:
           files: |
             sdk/bin/packages/**/*.apk
+            dist/*.apk
             dist/*.tar.gz

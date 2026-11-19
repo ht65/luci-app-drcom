@@ -9,9 +9,12 @@
 ## 功能
 
 - 开机自动认证，断线自动重连（守护循环只看「现在能不能上网」，不看上次结果）
-- LuCI 页面：状态卡片、上线/下线、实时日志、账号与参数配置
-- 「下线路由器」只断开本机上行，不影响同账号的手机等其他设备
+- LuCI 页面：状态卡片、上线/下线/立即重新认证、实时日志、账号与参数配置
+- 认证失败按指数退避重试；连续失败过多会暂停自动重试并提示原因，避免把账号撞到风控
+- 最近一次失败原因直接显示在界面上，不用去翻日志
+- 「下线路由器」只断开本机上行，不影响同账号的手机等其他设备，且暂停状态跨重启保留
 - 账号密码只存在路由器本地 `/etc/config/drcom`（权限 600）
+- 上行重新拨起时只唤醒守护进程，不再整体重启服务
 
 ## 适合什么环境
 
@@ -42,11 +45,15 @@
 
 ```sh
 cd /tmp
-wget -O drcom.tar.gz https://github.com/ht65/luci-app-drcom/releases/latest/download/luci-app-drcom-1.0.1.tar.gz
+wget -O drcom.tar.gz https://github.com/ht65/luci-app-drcom/releases/latest/download/luci-app-drcom.tar.gz
 tar -xzf drcom.tar.gz
 cd luci-app-drcom
 sh install.sh
 ```
+
+> 链接里的 `luci-app-drcom.tar.gz` 是不带版本号的固定名，始终指向最新 Release，发新版不用改文档。
+> 想固定某个版本的话，去 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下具体名字，形如 `luci-app-drcom-1.0.2.tar.gz`。
+
 装完打开 LuCI：**服务 → Dr.COM 认证**，填账号密码，保存。
 
 已存在的 `/etc/config/drcom` 不会被覆盖，升级不会丢账号。
@@ -55,10 +62,10 @@ sh install.sh
 
 ImmortalWrt 25.12 起包管理器换成了 apk-tools 3，安装包是带签名的 v3 格式（二进制 ADB 容器），只能在 Linux 环境用 SDK 编译产出，手工打包不可行。
 
-本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-1.0.1-r1.apk`，然后在路由器上：
+本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom.apk`（固定名，指向最新版），然后在路由器上：
 
 ```sh
-apk add --allow-untrusted ./luci-app-drcom-1.0.1-r1.apk
+apk add --allow-untrusted ./luci-app-drcom.apk
 ```
 
 用 apk 安装的好处是：它会正常出现在 LuCI 的「软件包」列表里，也能用 `apk del luci-app-drcom` 卸载。
@@ -78,7 +85,7 @@ cp -r luci-app-drcom <sdk>/package/
 cd <sdk>
 make defconfig
 make package/luci-app-drcom/compile V=s
-# 产物：bin/packages/*/base/luci-app-drcom-1.0.1-r1.apk
+# 产物：bin/packages/*/base/luci-app-drcom-*.apk
 ```
 
 `Makefile` 不依赖 luci feed，只依赖 `rpcd`，包架构为 `all`。
@@ -95,7 +102,9 @@ LuCI 页面里都能改，也可以直接改 `/etc/config/drcom`：
 | `uplink` | 上行接口，`auto` 自动在无线中继 `wwan` 和有线 `wan` 之间选已获取 IP 的那个 |
 | `portal_host` / `portal_ip` / `portal_port` | 认证门户，默认值为重庆财经职业学院的 `login.cqcfe.com` / `172.22.44.46:801`，**换学校必须改** |
 | `check_interval` | 在线检测间隔（秒），越大越省流量，越小掉线恢复越快 |
-| `retry_interval` | 认证失败重试间隔（秒） |
+| `retry_interval` | 首次重试间隔（秒）；连续失败时按指数退避逐次拉长 |
+| `retry_max_interval` | 退避上限（秒），默认 `300` |
+| `fail_max` | 连续失败达到该次数后暂停自动重试，默认 `5`，避免账号被风控 |
 
 改完点「保存并应用」，最多 60 秒自动生效；要立刻生效点「重启服务」。
 
@@ -106,14 +115,15 @@ LuCI 页面里都能改，也可以直接改 `/etc/config/drcom`：
 1. **一个账号通常只允许 1 台 PC + 1 台移动终端。** 路由器会占掉一个槽位（`terminal_type` 默认 `1`，即 PC 槽）。接在路由器后面的电脑走 NAT，不额外占槽；手机若直连校园网则占移动终端槽，两者可以共存。
 2. **注销接口在这个部署里是空转的。** 返回「注销成功」但在线会话并不会消失，所以要真正下线只能断开上行——这就是「下线路由器」按钮做的事。
 3. **部分校园网有无感知认证。** 上行重新连上后会由 AC 自动完成认证，不经过本插件的登录请求。这意味着下线期间不要重新连上上行，否则可能自动回到在线状态。
-4. **「下线路由器」会连带断开路由器后面的设备上网**，这是「下线」的应有之义；WiFi 本身不断，随时可以回页面点上线。
+4. **「下线路由器」会连带断开路由器后面的设备上网**，这是「下线」的应有之义；WiFi 本身不断，随时可以回页面点上线。暂停标记存在 `/etc/drcom.paused`，重启路由器后仍保持暂停，需要点「上线」才会恢复。
+5. **连续失败会自动暂停重试。** 达到 `fail_max`（默认 5）次后守护不再自动登录，界面会显示最近一次失败原因。改好账号 / 密码 / 运营商后缀后点「立即重新认证」即可恢复；如果网络自己恢复了（例如无感知认证重新生效），守护也会自动解除暂停。
 
 ## 命令行
 
 ```sh
-/usr/sbin/drcom-portal status    # 查看状态与连通性
-/usr/sbin/drcom-portal login     # 立即重新认证
-/usr/sbin/drcom-portal online    # 拉起上行
+/usr/sbin/drcom-portal status    # 查看状态、最近一次失败原因与连通性
+/usr/sbin/drcom-portal login     # 立即重新认证（已在线时不会重复登录）
+/usr/sbin/drcom-portal online    # 拉起上行并解除暂停
 /usr/sbin/drcom-portal offline   # 断开上行并暂停自动认证
 logread | grep drcom             # 看日志
 ```

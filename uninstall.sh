@@ -21,6 +21,11 @@ rm -f /etc/init.d/drcom \
       /www/luci-static/resources/view/drcom/overview.js
 rm -rf /www/luci-static/resources/view/drcom /usr/share/drcom
 
+echo "==> 清理运行时状态"
+# 暂停标记在 /etc 下，不清掉的话下次装回来会仍然处于「已下线」状态
+rm -rf /var/run/drcom
+rm -f /etc/drcom.paused
+
 if [ "$1" = "--purge" ]; then
 	echo "==> 删除配置"
 	rm -f /etc/config/drcom

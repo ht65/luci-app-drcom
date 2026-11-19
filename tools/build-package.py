@@ -69,12 +69,17 @@ def main():
             tar.addfile(info, f)
         count += 1
 
+    # 缺文件直接失败：CI 里安静地打出一个残缺的发布包比报错危险得多
+    missing = [item for item in INCLUDE if not os.path.exists(os.path.join(ROOT, item))]
+    if missing:
+        sys.exit('错误：缺少必需文件/目录：%s' % ', '.join(missing))
+
+    if VERSION == '0.0.0':
+        sys.exit('错误：没能从 Makefile 读到 PKG_VERSION')
+
     with tarfile.open(out, 'w:gz', format=tarfile.USTAR_FORMAT) as tar:
         for item in INCLUDE:
-            if os.path.exists(os.path.join(ROOT, item)):
-                add(item)
-            else:
-                print('警告：缺少 %s，已跳过' % item, file=sys.stderr)
+            add(item)
 
     print('已生成: %s' % out)
     print('  大小: %.1f KB  文件数: %d' % (os.path.getsize(out) / 1024.0, count))

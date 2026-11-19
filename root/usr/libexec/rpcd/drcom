@@ -3,26 +3,41 @@
 . /usr/share/libubox/jshn.sh
 
 STATE=/var/run/drcom/state
+STATE_DIR=/var/run/drcom
 
-cfg() { uci -q get "drcom.main.$1"; }
+# 取 uci 值；缺失时用和 drcom-portal 一致的默认值，
+# 避免界面显示（例如「已禁用」）与运行时实际行为对不上。
+cfg() {
+	local v
+	v=$(uci -q get "drcom.main.$1")
+	if [ -n "$v" ]; then
+		printf '%s' "$v"
+	else
+		printf '%s' "$2"
+	fi
+}
 
 method_status() {
-	local running=0 online=0 paused=0 ip="" uplink="" account="" stamp=0 age=-1 port ser term configured=0
+	local running=0 online=0 paused=0 hold=0 fails=0 ip="" uplink="" account=""
+	local stamp=0 age=-1 port ser term configured=0 enabled=1 last_error=""
 
 	pgrep -f "drcom-portal watch" >/dev/null 2>&1 && running=1
 
 	[ -f "$STATE" ] && . "$STATE"
-	[ -n "$stamp" ] && [ "$stamp" -gt 0 ] 2>/dev/null && age=$(( $(date +%s) - stamp ))
+	[ "$stamp" -gt 0 ] 2>/dev/null && age=$(( $(date +%s) - stamp ))
 
-	port=$(cfg portal_port)
-	ser=$(cat /var/run/drcom/server 2>/dev/null)
-	term=$(cfg terminal_type)
-	[ -n "$(cfg username)" ] && [ -n "$(cfg password)" ] && configured=1
+	port=$(cfg portal_port 801)
+	ser=$(cat "$STATE_DIR/server" 2>/dev/null)
+	term=$(cfg terminal_type 1)
+	enabled=$(cfg enabled 1)
+	[ -n "$(uci -q get drcom.main.username)" ] && [ -n "$(uci -q get drcom.main.password)" ] && configured=1
 
 	json_init
 	json_add_int    running    "$running"
 	json_add_int    online     "$online"
 	json_add_int    paused     "${paused:-0}"
+	json_add_int    hold       "${hold:-0}"
+	json_add_int    fails      "${fails:-0}"
 	json_add_int    configured "$configured"
 	json_add_string ip         "$ip"
 	json_add_string uplink     "$uplink"
@@ -31,7 +46,8 @@ method_status() {
 	json_add_string port       "$port"
 	json_add_string terminal   "$term"
 	json_add_int    age        "$age"
-	json_add_int    enabled    "$(cfg enabled)"
+	json_add_int    enabled    "$enabled"
+	json_add_string last_error "${last_error:-}"
 	json_dump
 }
 
@@ -52,6 +68,7 @@ method_action() {
 	case "$1" in
 		online)  out=$(/usr/sbin/drcom-portal online 2>&1) ;;
 		offline) out=$(/usr/sbin/drcom-portal offline 2>&1) ;;
+		relogin) out=$(/usr/sbin/drcom-portal login 2>&1) ;;
 		restart) /etc/init.d/drcom restart >/dev/null 2>&1; out="认证服务已重启" ;;
 	esac
 	json_init
@@ -66,6 +83,7 @@ case "$1" in
 		json_add_object log;     json_close_object
 		json_add_object online;  json_close_object
 		json_add_object offline; json_close_object
+		json_add_object relogin; json_close_object
 		json_add_object restart; json_close_object
 		json_dump
 		;;
@@ -75,6 +93,7 @@ case "$1" in
 			log)     method_log ;;
 			online)  method_action online ;;
 			offline) method_action offline ;;
+			relogin) method_action relogin ;;
 			restart) method_action restart ;;
 			*) json_init; json_add_string message "unknown method"; json_dump ;;
 		esac

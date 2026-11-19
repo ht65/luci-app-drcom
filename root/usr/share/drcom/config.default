@@ -23,5 +23,10 @@ config drcom 'main'
 	# 在线检测间隔 / 认证失败重试间隔（秒）
 	option check_interval '60'
 	option retry_interval '20'
+
+	# 连续失败多少次后暂停自动重试（防止账号被风控），以及退避上限（秒）
+	option fail_max '5'
+	option retry_max_interval '300'
+
 	option probe_url 'http://www.msftconnecttest.com/connecttest.txt'
 	option probe_expect 'Microsoft Connect Test'

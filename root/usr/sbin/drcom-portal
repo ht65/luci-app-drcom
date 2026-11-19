@@ -2,52 +2,126 @@
 # Dr.COM ePortal (城市热点) 网页认证客户端
 #
 # 用于让路由器代替接入设备完成校园网 Portal 认证。
-# 用法: drcom-portal {online|offline|login|status|watch}
+# 用法: drcom-portal {online|offline|login|status|watch|wake|idle}
 
 . /lib/functions.sh
 
+# 状态目录里有账号等信息，统一收紧权限
+umask 077
+
 STATE_DIR=/var/run/drcom
-PAUSE_FILE="$STATE_DIR/paused"
+PAUSE_FILE=/etc/drcom.paused	# 手动下线标记：放 /etc 才能跨重启保留
+HOLD_FILE="$STATE_DIR/hold"	# 连续失败过多后暂停自动重试
+FAIL_FILE="$STATE_DIR/fails"
+ERR_FILE="$STATE_DIR/last_error"
+PID_FILE="$STATE_DIR/watch.pid"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-log() { echo "$(date '+%F %T') $*"; }
-err() { echo "$(date '+%F %T') ERROR: $*" >&2; }
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+err() { printf '%s ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
 
 load_config() {
 	config_load drcom
-	config_get_bool ENABLED        main enabled           1
-	config_get      USERNAME       main username          ""
-	config_get      PASSWORD       main password          ""
-	config_get      CARRIER        main carrier           ""
-	config_get      PORTAL_HOST    main portal_host "login.cqcfe.com"
-	config_get      PORTAL_IP      main portal_ip   "172.22.44.46"
-	config_get      PORTAL_PORT    main portal_port       "801"
-	config_get      UPLINK         main uplink            "auto"
-	config_get      TERMINAL_TYPE  main terminal_type     "1"
-	config_get      CHECK_INTERVAL main check_interval    "60"
-	config_get      RETRY_INTERVAL main retry_interval    "20"
-	config_get      PROBE_URL      main probe_url "http://www.msftconnecttest.com/connecttest.txt"
-	config_get      PROBE_EXPECT   main probe_expect "Microsoft Connect Test"
+	config_get_bool ENABLED         main enabled            1
+	config_get      USERNAME        main username           ""
+	config_get      PASSWORD        main password           ""
+	config_get      CARRIER         main carrier            ""
+	config_get      PORTAL_HOST     main portal_host "login.cqcfe.com"
+	config_get      PORTAL_IP       main portal_ip   "172.22.44.46"
+	config_get      PORTAL_PORT     main portal_port        "801"
+	config_get      UPLINK          main uplink             "auto"
+	config_get      TERMINAL_TYPE   main terminal_type      "1"
+	config_get      CHECK_INTERVAL  main check_interval     "60"
+	config_get      RETRY_INTERVAL  main retry_interval     "20"
+	config_get      RETRY_MAX       main retry_max_interval "300"
+	config_get      FAIL_MAX        main fail_max           "5"
+	config_get      PROBE_URL       main probe_url "http://www.msftconnecttest.com/connecttest.txt"
+	config_get      PROBE_EXPECT    main probe_expect "Microsoft Connect Test"
 	ACCOUNT="$USERNAME$CARRIER"
 	# 0-未知 1-PC 2-手机 3-平板(横屏) 4-平板(竖屏)，决定上报的终端类型
 	case "$TERMINAL_TYPE" in
 		0|1|2|3|4) ;;
 		*) TERMINAL_TYPE=1 ;;
 	esac
+	# 兜底校验：防止手改配置写成 0/非数字，让 sleep 变成紧循环
+	[ "$CHECK_INTERVAL" -ge 10 ] 2>/dev/null || CHECK_INTERVAL=10
+	[ "$RETRY_INTERVAL" -ge 5 ] 2>/dev/null || RETRY_INTERVAL=5
+	[ "$FAIL_MAX" -ge 1 ] 2>/dev/null || FAIL_MAX=5
+	[ "$RETRY_MAX" -ge "$RETRY_INTERVAL" ] 2>/dev/null || RETRY_MAX=300
 }
+
+# 可被信号打断的睡眠。
+# 前台 sleep 会让 ash 推迟执行 trap，procd 的 term_timeout(5s) 一到就直接 SIGKILL，
+# 于是 trap 里的「服务停止」和状态刷新全都不会发生（实测过）。
+sleep_pid=""
+do_sleep() {
+	sleep "$1" &
+	sleep_pid=$!
+	wait "$sleep_pid" 2>/dev/null
+	kill "$sleep_pid" 2>/dev/null
+	wait "$sleep_pid" 2>/dev/null
+	sleep_pid=""
+}
+
+# 状态文件会被 rpcd 用 sh 的 "." 读进来，值必须干净：去掉引号、换行、控制字符并限长
+sanitize() {
+	printf '%s' "$1" | tr -d '\r\n\t' | tr -d "'" | cut -c1-120
+}
+
+get_fails() {
+	local n
+	n=$(cat "$FAIL_FILE" 2>/dev/null)
+	case "$n" in
+		''|*[!0-9]*) n=0 ;;
+	esac
+	printf '%s' "$n"
+}
+
+clear_fails() { rm -f "$FAIL_FILE" "$HOLD_FILE" 2>/dev/null; }
+
+bump_fail() {
+	local n
+	n=$(get_fails)
+	n=$((n + 1))
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	printf '%s' "$n" > "$FAIL_FILE"
+	if [ "$n" -ge "$FAIL_MAX" ] && [ ! -f "$HOLD_FILE" ]; then
+		: > "$HOLD_FILE"
+		log "连续认证失败 $n 次，已暂停自动重试；请检查账号后在界面点「立即重新认证」重试"
+	fi
+}
+
+# 指数退避：retry_interval × 2^(n-1)，上限 retry_max_interval
+backoff_delay() {
+	local n d
+	n=$(get_fails)
+	[ "$n" -ge 1 ] 2>/dev/null || n=1
+	[ "$n" -gt 6 ] && n=6
+	d=$(( RETRY_INTERVAL * (1 << (n - 1)) ))
+	[ "$d" -gt "$RETRY_MAX" ] 2>/dev/null && d=$RETRY_MAX
+	printf '%s' "$d"
+}
+
+set_error() { mkdir -p "$STATE_DIR" 2>/dev/null; printf '%s' "$(sanitize "$1")" > "$ERR_FILE"; }
+clear_error() { rm -f "$ERR_FILE" 2>/dev/null; }
 
 # 写入状态快照供 LuCI 界面秒读，避免每次开页面都要等探测超时
 save_state() {
-	mkdir -p "$STATE_DIR"
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	chmod 700 "$STATE_DIR" 2>/dev/null
 	{
-		echo "online=$1"
-		echo "ip='$2'"
-		echo "uplink='$3'"
-		echo "account='$ACCOUNT'"
-		if [ -f "$PAUSE_FILE" ]; then echo "paused=1"; else echo "paused=0"; fi
-		echo "stamp=$(date +%s)"
+		printf 'online=%s\n' "$1"
+		printf "ip='%s'\n"      "$(sanitize "$2")"
+		printf "uplink='%s'\n"  "$(sanitize "$3")"
+		printf "account='%s'\n" "$(sanitize "$ACCOUNT")"
+		printf 'paused=%s\n' "$( [ -f "$PAUSE_FILE" ] && echo 1 || echo 0 )"
+		printf 'hold=%s\n'   "$( [ -f "$HOLD_FILE" ] && echo 1 || echo 0 )"
+		printf 'fails=%s\n'  "$(get_fails)"
+		printf "last_error='%s'\n" "$(sanitize "$(cat "$ERR_FILE" 2>/dev/null)")"
+		printf 'stamp=%s\n'  "$(date +%s)"
 	} > "$STATE_DIR/state.tmp" 2>/dev/null
 	mv "$STATE_DIR/state.tmp" "$STATE_DIR/state" 2>/dev/null
+	chmod 600 "$STATE_DIR"/* 2>/dev/null
 }
 
 urlencode() {
@@ -68,11 +142,6 @@ iface_ip() {
 		jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null
 }
 
-iface_dev() {
-	ubus call network.interface."$1" status 2>/dev/null | \
-		jsonfilter -e '@.l3_device' 2>/dev/null
-}
-
 # auto: 优先无线中继(wwan)，其次有线(wan)，取第一个拿到 IP 的
 resolve_uplink() {
 	case "$UPLINK" in
@@ -87,21 +156,28 @@ resolve_uplink() {
 	esac
 }
 
-# 认证服务器地址：优先用上次探测结果，其次从认证页取 v4serip
+# 认证服务器地址：优先用上次探测结果，其次从认证页取 v4serip。
+# 注意：只有真的从认证页解析出地址时才写缓存；用兜底值时不留缓存，
+# 这样门户页偶尔打不开不会把兜底 IP 永久固化，学校换地址后下一轮还能重探。
 portal_server() {
-	local cached="$STATE_DIR/server"
+	local cached="$STATE_DIR/server" page="$STATE_DIR/page.htm" ser=""
 	[ -s "$cached" ] && { cat "$cached"; return 0; }
 
-	local page="$STATE_DIR/page.htm" ser=""
 	wget -q -O "$page" --timeout=8 -U "$UA" \
 		"http://$PORTAL_HOST/a79.htm?url=http://www.msftconnecttest.com/redirect" 2>/dev/null
 	if [ -s "$page" ]; then
 		ser=$(grep -o "v4serip=[^;]*" "$page" 2>/dev/null | head -1 | cut -d= -f2 | tr -d "'\" ")
 	fi
-	[ -z "$ser" ] && ser="$PORTAL_IP"
-	mkdir -p "$STATE_DIR"
-	echo "$ser" > "$cached"
-	echo "$ser"
+	rm -f "$page"
+
+	if [ -n "$ser" ]; then
+		mkdir -p "$STATE_DIR" 2>/dev/null
+		printf '%s\n' "$ser" > "$cached"
+		chmod 600 "$cached" 2>/dev/null
+		printf '%s' "$ser"
+	else
+		printf '%s' "$PORTAL_IP"
+	fi
 }
 
 # 未认证时该地址会被劫持到认证页，只有真正通了才会返回预期内容
@@ -114,26 +190,28 @@ probe_online() {
 do_login() {
 	[ -n "$ACCOUNT" ] && [ -n "$PASSWORD" ] || { err "账号或密码未配置"; return 2; }
 
-	local up ip dev mac ser resp msg
+	local up ip ser resp urls url msg
 	up=$(resolve_uplink)
 	ip=$(iface_ip "$up")
 	[ -z "$ip" ] && { err "上行接口 $up 未获取到 IP，暂不认证"; return 3; }
 
-	dev=$(iface_dev "$up")
-	mac=$(cat /sys/class/net/"$dev"/address 2>/dev/null | tr -d ':' | tr 'A-F' 'a-f')
-	[ -z "$mac" ] && mac=000000000000
-
 	ser=$(portal_server)
-	mkdir -p "$STATE_DIR"
+	mkdir -p "$STATE_DIR" 2>/dev/null
 	resp="$STATE_DIR/login.json"
+	urls="$STATE_DIR/login.url"
 
-	wget -q -O "$resp" --timeout=12 -U "$UA" \
-		"http://$ser:$PORTAL_PORT/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,$(urlencode "$ACCOUNT")&user_password=$(urlencode "$PASSWORD")&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.1.3&terminal_type=$TERMINAL_TYPE&lang=zh-cn&v=$(date +%s)" 2>/dev/null
+	url="http://$ser:$PORTAL_PORT/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,$(urlencode "$ACCOUNT")&user_password=$(urlencode "$PASSWORD")&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.1.3&terminal_type=$TERMINAL_TYPE&lang=zh-cn&v=$(date +%s)"
+
+	# 密码在 URL 里，直接放命令行会出现在 /proc/<pid>/cmdline；改由 -i 从文件读
+	printf '%s\n' "$url" > "$urls"
+	wget -q -i "$urls" -O "$resp" --timeout=12 -U "$UA" 2>/dev/null
+	rm -f "$urls"
 
 	if [ ! -s "$resp" ]; then
 		# 服务器地址可能已变，清缓存让下次重新探测
 		rm -f "$STATE_DIR/server"
 		err "认证服务器 $ser:$PORTAL_PORT 无响应"
+		set_error "认证服务器 $ser:$PORTAL_PORT 无响应"
 		return 4
 	fi
 
@@ -145,95 +223,161 @@ do_login() {
 	msg=$(sed -n 's/.*"msg":"\([^"]*\)".*/\1/p' "$resp" | head -1)
 	[ -z "$msg" ] && msg=$(head -c 120 "$resp")
 	err "认证失败：$msg (账号=$ACCOUNT IP=$ip)"
+	set_error "认证失败：$msg"
 	return 1
 }
 
 # 下线本机：暂停自动认证并断开上行。
 # 校园网会话与接入点绑定，断开上行时 AC 会终止本机会话，且只影响这台设备。
 do_offline() {
-	mkdir -p "$STATE_DIR"
+	mkdir -p "$STATE_DIR" 2>/dev/null
 	: > "$PAUSE_FILE"
+	chmod 600 "$PAUSE_FILE" 2>/dev/null
+	rm -f "$HOLD_FILE" 2>/dev/null
+
 	local up
 	up=$(resolve_uplink)
 	log "下线本机：断开上行 $up"
 	ifdown "$up" >/dev/null 2>&1
-	sleep 2
+	do_sleep 2
 	save_state 0 "-" "$up"
 }
 
 # 上线本机：拉起上行。控制在 20 秒内返回，避免界面请求超时；
-# 残留的认证工作交给守护循环，它会在下一个周期补上。
+# 残留的认证工作交给守护循环（这里顺手唤醒它，别让它睡满一个周期）。
 do_online() {
-	rm -f "$PAUSE_FILE"
+	rm -f "$PAUSE_FILE" 2>/dev/null
+	clear_fails
 	local up ip i=0
 	up=$(resolve_uplink)
 	log "上线本机：拉起上行 $up"
 	ifup "$up" >/dev/null 2>&1
 
-	while [ $i -lt 6 ]; do
+	while [ $i -lt 5 ]; do
 		ip=$(iface_ip "$up")
 		[ -n "$ip" ] && break
-		sleep 2
+		do_sleep 2
 		i=$((i+1))
 	done
 
 	if [ -z "$ip" ]; then
 		err "上行 $up 尚未获取到 IP，交由守护继续处理"
 		save_state 0 "-" "$up"
+		do_wake
 		return 3
 	fi
 
 	if probe_online; then
+		clear_error
 		log "上线完成，无需重新认证"
 		save_state 1 "$ip" "$up"
 	else
 		log "上行已恢复，等待守护完成认证"
 		save_state 0 "$ip" "$up"
+		do_wake
 	fi
 
 	return 0
 }
 
-# 清掉暂停标记并立即认证一次
+# 立即重新认证（不碰接口，避免 ifup 带来的射频抖动）
 do_relogin() {
-	rm -f "$PAUSE_FILE"
-	log "重新认证"
-	do_login
 	local up ip
-	up=$(resolve_uplink); ip=$(iface_ip "$up")
+	rm -f "$PAUSE_FILE" 2>/dev/null
+	clear_fails
+
+	up=$(resolve_uplink)
+	ip=$(iface_ip "$up")
+
+	if probe_online; then
+		clear_error
+		log "当前已在线，无需重新认证"
+		save_state 1 "$ip" "$up"
+		do_wake
+		return 0
+	fi
+
+	log "重新认证"
+	if do_login; then
+		clear_fails
+		clear_error
+		do_sleep 3
+	fi
+	up=$(resolve_uplink)
+	ip=$(iface_ip "$up")
 	if probe_online; then save_state 1 "$ip" "$up"; else save_state 0 "$ip" "$up"; fi
+	do_wake
 }
 
 do_status() {
-	local up ip
+	local up ip fails errmsg
 	up=$(resolve_uplink)
 	ip=$(iface_ip "$up")
+	fails=$(get_fails)
+	errmsg=$(cat "$ERR_FILE" 2>/dev/null)
+
 	echo "上行接口: $up"
 	echo "上行地址: ${ip:-未获取}"
 	echo "账号:     ${ACCOUNT:-未配置}"
 	echo "终端类型: $TERMINAL_TYPE"
 	echo "认证服务器: $(portal_server):$PORTAL_PORT"
-	[ -f "$PAUSE_FILE" ] && echo "自动认证: 已暂停"
+	[ -f "$PAUSE_FILE" ] && echo "自动认证: 已暂停（手动下线）"
+	[ -f "$HOLD_FILE" ] && echo "自动认证: 已暂停（连续失败 $fails 次）"
+	[ -n "$errmsg" ] && echo "最近错误: $errmsg"
 	if probe_online; then echo "网络状态: 已认证，可上网"; else echo "网络状态: 未认证/无网络"; fi
 }
 
-watch_loop() {
-	trap 'log "服务停止"; save_state 0 "-" "-"; exit 0' TERM INT
+# 唤醒守护进程立即重新检测（热插拔、手动上下线后调用），比整体重启服务轻得多
+do_wake() {
+	local pid
+	pid=$(cat "$PID_FILE" 2>/dev/null)
+	case "$pid" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+	kill -USR1 "$pid" 2>/dev/null || {
+		log "唤醒失败：守护进程 $pid 不在了"
+		return 1
+	}
+}
 
-	log "服务启动"
+# 供 init.d 在「禁用/停止」时刷新一次状态，避免界面停留在过期快照
+do_idle() {
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	save_state 0 "-" "-"
+}
+
+on_stop() {
+	[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null
+	rm -f "$PID_FILE" 2>/dev/null
+	log "服务停止"
+	save_state 0 "-" "-"
+	exit 0
+}
+
+watch_loop() {
+	trap 'on_stop' TERM INT
+	# USR1 只用来「戳醒」循环立即重新检测，不打日志，免得每次接口 ifup 都往 syslog 里写一行
+	trap ':' USR1
+
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	printf '%s\n' "$$" > "$PID_FILE"
+
+	log "服务启动（连续失败 $FAIL_MAX 次后暂停自动重试）"
+	[ -f "$PAUSE_FILE" ] && log "检测到手动下线标记，保持暂停状态"
+
 	while true; do
 		# 每轮重新读配置，界面上改完设置无需重启服务即可生效
 		load_config
 
 		if [ "$ENABLED" != "1" ]; then
 			save_state 0 "-" "-"
-			sleep 60
+			do_sleep 60
 			continue
 		fi
 
 		if [ -z "$ACCOUNT" ] || [ -z "$PASSWORD" ]; then
 			save_state 0 "-" "-"
-			sleep 60
+			do_sleep 60
 			continue
 		fi
 
@@ -242,28 +386,46 @@ watch_loop() {
 		ip=$(iface_ip "$up")
 		if [ -z "$ip" ]; then
 			save_state 0 "-" "$up"
-			sleep 10
+			do_sleep 10
 			continue
 		fi
 
-		# 用户手动下线后暂停自动认证，直到点「上线」或重启路由器
+		# 用户手动下线后暂停自动认证，直到点「上线」或重启路由器（标记在 /etc，可跨重启）
 		if [ -f "$PAUSE_FILE" ]; then
 			if probe_online; then save_state 1 "$ip" "$up"; else save_state 0 "$ip" "$up"; fi
-			sleep "$RETRY_INTERVAL"
+			do_sleep "$RETRY_INTERVAL"
+			continue
+		fi
+
+		# 连续失败过多：不再自动重试，避免把账号撞到风控；网络自己恢复就自动解除
+		if [ -f "$HOLD_FILE" ]; then
+			if probe_online; then
+				log "网络已恢复，解除失败暂停"
+				clear_fails
+				clear_error
+				save_state 1 "$ip" "$up"
+			else
+				save_state 0 "$ip" "$up"
+			fi
+			do_sleep "$CHECK_INTERVAL"
 			continue
 		fi
 
 		if probe_online; then
+			clear_fails
+			clear_error
 			save_state 1 "$ip" "$up"
-			sleep "$CHECK_INTERVAL"
+			do_sleep "$CHECK_INTERVAL"
 			continue
 		fi
 
 		# 二次确认，避免瞬时抖动误判
-		sleep 3
+		do_sleep 3
 		if probe_online; then
+			clear_fails
+			clear_error
 			save_state 1 "$ip" "$up"
-			sleep "$CHECK_INTERVAL"
+			do_sleep "$CHECK_INTERVAL"
 			continue
 		fi
 
@@ -271,27 +433,32 @@ watch_loop() {
 		if [ -f "$STATE_DIR/last_ip" ] && [ "$(cat "$STATE_DIR/last_ip")" != "$ip" ]; then
 			rm -f "$STATE_DIR/server"
 		fi
-		echo "$ip" > "$STATE_DIR/last_ip"
+		printf '%s\n' "$ip" > "$STATE_DIR/last_ip"
 
 		if do_login; then
-			sleep 4
+			do_sleep 4
 			if probe_online; then
+				clear_fails
+				clear_error
 				save_state 1 "$ip" "$up"
-				sleep "$CHECK_INTERVAL"
+				do_sleep "$CHECK_INTERVAL"
 			else
 				save_state 0 "$ip" "$up"
+				set_error "认证接口返回成功，但网络仍未通"
 				log "认证接口返回成功，但网络仍未通，稍后重试"
-				sleep "$RETRY_INTERVAL"
+				bump_fail
+				do_sleep "$(backoff_delay)"
 			fi
 		else
 			save_state 0 "$ip" "$up"
-			sleep "$RETRY_INTERVAL"
+			bump_fail
+			do_sleep "$(backoff_delay)"
 		fi
 	done
 }
 
 load_config
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" 2>/dev/null
 
 case "$1" in
 	online)  do_online ;;
@@ -299,5 +466,7 @@ case "$1" in
 	login)   do_relogin ;;
 	status)  do_status ;;
 	watch)   watch_loop ;;
-	*) echo "用法: $0 {online|offline|login|status|watch}"; exit 1 ;;
+	wake)    do_wake ;;
+	idle)    do_idle ;;
+	*) echo "用法: $0 {online|offline|login|status|watch|wake|idle}"; exit 1 ;;
 esac

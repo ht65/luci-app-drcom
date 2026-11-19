@@ -11,6 +11,8 @@ start_service() {
 
 	if [ "$enabled" != "1" ]; then
 		logger -t drcom "插件已禁用，跳过启动"
+		# 刷新一次状态，免得界面拿着一份过期快照显示「服务未运行」
+		[ -x /usr/sbin/drcom-portal ] && /usr/sbin/drcom-portal idle >/dev/null 2>&1
 		return 0
 	fi
 
@@ -25,5 +27,7 @@ start_service() {
 
 stop_service() {
 	# 故意不注销：本环境的注销是空转的，真正下线靠断开上行（见 drcom-portal offline）
+	# 停止后刷新状态，避免界面停留在「已认证」
+	[ -x /usr/sbin/drcom-portal ] && /usr/sbin/drcom-portal idle >/dev/null 2>&1
 	:
 }
