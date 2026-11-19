@@ -109,6 +109,19 @@ LuCI 页面里都能改，也可以直接改 `/etc/config/drcom`：
 
 改完点「保存并应用」，最多 60 秒自动生效；要立刻生效点「重启服务」。
 
+## 发版流程
+
+```sh
+# 1) 先在 CHANGELOG.md 里加一段：## vX.Y.Z — YYYY-MM-DD（写清楚「新增」与「修复」）
+# 2) 同步改 Makefile 的 PKG_VERSION（构建产物名取自这里）
+# 3) 提交并推 main
+git tag -a vX.Y.Z -m "vX.Y.Z: 一句话概括"
+git push origin vX.Y.Z
+```
+
+CI 会把 `CHANGELOG.md` 里对应版本的段落**作为 Release 说明**发出去；找不到该段落会让构建直接失败，
+所以不存在「发了版却没有改动说明」的情况。Release 只挂两个带版本号的文件。
+
 ## 已知限制
 
 这些是实测出来的行为，不是 bug：

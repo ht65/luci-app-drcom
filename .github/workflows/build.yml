@@ -52,6 +52,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 发版说明来自 CHANGELOG.md 的对应段落；缺段落就直接失败，
+      # 免得发出一个没有「改动/新增」说明的版本。放在最前面是为了快速失败（不浪费 SDK 下载）。
+      - name: 检查并提取本版改动说明
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 tools/changelog-section.py "${GITHUB_REF_NAME}" > dist/release-notes.md
+          echo "::group::本版说明"
+          cat dist/release-notes.md
+          echo "::endgroup::"
+
       - name: 下载 SDK
         run: |
           set -euo pipefail
@@ -112,4 +124,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          # 正文取自上一步从 CHANGELOG.md 提取的段落
+          body_path: dist/release-notes.md
           files: release/*
