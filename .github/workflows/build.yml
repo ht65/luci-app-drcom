@@ -92,9 +92,11 @@ jobs:
           # README 里的下载链接指向这两个不带版本号的名字，
           # 这样发下一版时不用再手动改文档
           apk="$(find sdk/bin/packages -name '*.apk' -type f -print -quit)"
+          tarball="$(find dist -maxdepth 1 -name '*.tar.gz' -type f -print -quit)"
           test -n "$apk"
-          mkdir -p dist
+          test -n "$tarball"
           cp "$apk" dist/luci-app-drcom.apk
+          cp "$tarball" dist/luci-app-drcom.tar.gz
           ls -lh dist
 
       - name: 上传构建产物
