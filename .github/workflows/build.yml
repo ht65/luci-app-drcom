@@ -89,15 +89,16 @@ jobs:
       - name: 准备发布文件
         run: |
           set -euo pipefail
-          # 只用不带版本号的固定名，每个 Release 就两个文件：
-          # README 里的 releases/latest/download 链接才能长期有效，也不用带版本副本。
+          # 每个 Release 只挂 2 个文件，文件名带版本号（与 v1.0.0 / v1.0.1 保持一致）：
+          #   luci-app-drcom-<版本>-r1.apk
+          #   luci-app-drcom-<版本>.tar.gz
           apk="$(find sdk/bin/packages -name '*.apk' -type f -print -quit)"
           tarball="$(find dist -maxdepth 1 -name '*.tar.gz' -type f -print -quit)"
           test -n "$apk"
           test -n "$tarball"
           mkdir -p release
-          cp "$apk" release/luci-app-drcom.apk
-          cp "$tarball" release/luci-app-drcom.tar.gz
+          cp "$apk" "release/$(basename "$apk")"
+          cp "$tarball" "release/$(basename "$tarball")"
           ls -lh release
 
       - name: 上传构建产物
