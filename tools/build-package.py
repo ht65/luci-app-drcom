@@ -13,8 +13,23 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG_NAME = 'luci-app-drcom'
-VERSION = '1.0.0'
 DIST = os.path.join(ROOT, 'dist')
+
+
+def read_version():
+    """版本号统一取自 Makefile 的 PKG_VERSION，避免两处写死导致不一致"""
+    mk = os.path.join(ROOT, 'Makefile')
+    try:
+        with open(mk, encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('PKG_VERSION:='):
+                    return line.split(':=', 1)[1].strip()
+    except OSError:
+        pass
+    return '0.0.0'
+
+
+VERSION = read_version()
 
 INCLUDE = ['install.sh', 'uninstall.sh', 'Makefile', 'README.md', 'LICENSE', 'root']
 EXECUTABLES = {
