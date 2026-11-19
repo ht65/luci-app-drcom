@@ -51,8 +51,10 @@ cd luci-app-drcom
 sh install.sh
 ```
 
-> 链接里的 `luci-app-drcom.tar.gz` 是不带版本号的固定名，始终指向最新 Release，发新版不用改文档。
-> 想固定某个版本的话，去 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下具体名字，形如 `luci-app-drcom-1.0.2.tar.gz`。
+> 每个 Release 只上传两个文件，文件名**不带版本号**：`luci-app-drcom.tar.gz` 和 `luci-app-drcom.apk`。
+> 这样 `releases/latest/download/...` 永远指向最新版，发新版不用改文档。
+> 想固定到某个版本，把 `latest` 换成标签即可，例如
+> `https://github.com/ht65/luci-app-drcom/releases/download/v1.0.2/luci-app-drcom.tar.gz`。
 
 装完打开 LuCI：**服务 → Dr.COM 认证**，填账号密码，保存。
 
@@ -62,7 +64,7 @@ sh install.sh
 
 ImmortalWrt 25.12 起包管理器换成了 apk-tools 3，安装包是带签名的 v3 格式（二进制 ADB 容器），只能在 Linux 环境用 SDK 编译产出，手工打包不可行。
 
-本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom.apk`（固定名，指向最新版），然后在路由器上：
+本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom.apk`（固定名，`latest` 指向最新版；要固定版本就把 `latest` 换成标签），然后在路由器上：
 
 ```sh
 apk add --allow-untrusted ./luci-app-drcom.apk
