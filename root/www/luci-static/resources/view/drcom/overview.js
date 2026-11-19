@@ -20,30 +20,44 @@ var TERM_NAMES = {
 	'4': '平板 · 竖屏'
 };
 
+// 布局全部交给 CSS 类，便于随容器宽度自适应；LuCI 主题自带的 .cbi-section 没有水平内边距
+var CSS = [
+	'.drcom-body{padding:0 16px 14px}',
+	'.drcom-kv{display:flex;flex-wrap:wrap;gap:2px 14px;padding:8px 0;border-bottom:1px solid rgba(128,128,128,.18)}',
+	'.drcom-kv:last-child{border-bottom:none}',
+	'.drcom-kv-l{flex:0 0 96px;max-width:40%;opacity:.72;font-size:13px}',
+	'.drcom-kv-v{flex:1 1 180px;min-width:0;font-size:13px;word-break:break-all}',
+	'.drcom-btns{display:flex;flex-wrap:wrap;gap:8px}',
+	'.drcom-note{margin:10px 0 0;font-size:12px;opacity:.7;line-height:1.6}',
+	'.drcom-log{max-height:300px;overflow:auto;padding:10px;margin:0;background:rgba(127,127,127,.1);border-radius:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-all}',
+	'@media (max-width:560px){.drcom-kv-l{flex:0 0 100%;max-width:none}}'
+].join('\n');
+
 function section(title, children) {
 	return E('div', { 'class': 'cbi-section' }, [
 		E('h3', {}, title),
-		E('div', {}, children)
+		E('div', { 'class': 'drcom-body' }, children)
 	]);
 }
 
 function kv(label, valueNode) {
-	return E('div', {
-		'style': 'display:flex;gap:12px;padding:7px 0;border-bottom:1px solid rgba(128,128,128,.18)'
-	}, [
-		E('div', { 'style': 'flex:0 0 92px;opacity:.7;font-size:13px' }, label),
-		E('div', { 'style': 'font-size:13px;word-break:break-all' }, valueNode)
+	return E('div', { 'class': 'drcom-kv' }, [
+		E('div', { 'class': 'drcom-kv-l' }, label),
+		E('div', { 'class': 'drcom-kv-v' }, valueNode)
 	]);
 }
 
 return view.extend({
 	load: function() {
-		return Promise.all([ uci.load('drcom'), callStatus(), callLog() ]);
+		// 这里只读配置。状态与日志放到 render 之后串行拉取：
+		// 同时并发多个 RPC 会被 LuCI 合批，实测三个一起发时 Promise 不落地，
+		// 页面会一直停在「正在载入视图」。
+		return uci.load('drcom');
 	},
 
-	render: function(data) {
-		var st = data[1] || {};
-		var lg = data[2] || {};
+	render: function() {
+		var st = {};
+		var lg = {};
 
 		var badge = E('span', {
 			'style': 'display:inline-block;padding:2px 10px;border-radius:10px;color:#fff;font-size:12px;background:#666'
@@ -91,15 +105,18 @@ return view.extend({
 		applyStatus(st);
 
 		function refresh() {
-			return Promise.all([ callStatus(), callLog() ]).then(function(r) {
-				applyStatus(r[0]);
-				if (r[1] && r[1].lines)
-					logPre.textContent = r[1].lines.length ? r[1].lines.join('\n') : '（暂无日志）';
+			return callStatus().then(function(st) {
+				applyStatus(st);
+			}).then(function() {
+				return callLog();
+			}).then(function(lg) {
+				if (lg && lg.lines)
+					logPre.textContent = lg.lines.length ? lg.lines.join('\n') : '（暂无日志）';
 			}).catch(function() {});
 		}
 
 		function actionBtn(label, cls, fn) {
-			var btn = E('button', { 'class': 'cbi-button ' + cls, 'style': 'margin-right:8px' }, label);
+			var btn = E('button', { 'class': 'cbi-button ' + cls }, label);
 
 			btn.addEventListener('click', function(ev) {
 				ev.preventDefault();
@@ -130,16 +147,16 @@ return view.extend({
 		]);
 
 		var actions = section('手动操作', [
-			actionBtn('上线 / 立即登录', 'cbi-button-apply', callOnline),
-			actionBtn('下线路由器', 'cbi-button-reset', callOffline),
-			actionBtn('重启服务', 'cbi-button-action', callRestart),
-			E('p', { 'style': 'margin:10px 0 0;font-size:12px;opacity:.7' },
+			E('div', { 'class': 'drcom-btns' }, [
+				actionBtn('上线 / 立即登录', 'cbi-button-apply', callOnline),
+				actionBtn('下线路由器', 'cbi-button-reset', callOffline),
+				actionBtn('重启服务', 'cbi-button-action', callRestart)
+			]),
+			E('p', { 'class': 'drcom-note' },
 				'「下线路由器」会断开本机的上行连接并暂停自动认证。它只作用于这台路由器，不会波及同账号的手机等其他设备。')
 		]);
 
-		var logPre = E('pre', {
-			'style': 'max-height:300px;overflow:auto;padding:10px;margin:0;background:rgba(127,127,127,.1);border-radius:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-all'
-		}, (lg.lines && lg.lines.length) ? lg.lines.join('\n') : '（暂无日志）');
+		var logPre = E('pre', { 'class': 'drcom-log' }, '（加载中…）');
 
 		var logBox = section('实时日志', [ logPre ]);
 
@@ -202,9 +219,10 @@ return view.extend({
 
 		poll.add(refresh, 5);
 		poll.start();
+		refresh();
 
 		return Promise.resolve(m.render()).then(function(node) {
-			return E([ statusBox, actions, node, logBox ]);
+			return E([ E('style', {}, CSS), statusBox, actions, node, logBox ]);
 		});
 	}
 });
