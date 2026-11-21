@@ -239,9 +239,17 @@ do_login() {
 	return 1
 }
 
+# 总开关停用时，手动动作也不要去动上行/认证，避免和 USB CPE 等其它上行打架
+require_enabled() {
+	[ "$ENABLED" = "1" ] && return 0
+	err "插件已被总开关停用，忽略该操作"
+	return 1
+}
+
 # 下线本机：暂停自动认证并断开上行。
 # 校园网会话与接入点绑定，断开上行时 AC 会终止本机会话，且只影响这台设备。
 do_offline() {
+	require_enabled || return 0
 	mkdir -p "$STATE_DIR" 2>/dev/null
 	: > "$PAUSE_FILE"
 	chmod 600 "$PAUSE_FILE" 2>/dev/null
@@ -258,6 +266,7 @@ do_offline() {
 # 上线本机：拉起上行。控制在 20 秒内返回，避免界面请求超时；
 # 残留的认证工作交给守护循环（这里顺手唤醒它，别让它睡满一个周期）。
 do_online() {
+	require_enabled || return 0
 	rm -f "$PAUSE_FILE" 2>/dev/null
 	clear_fails
 	local up ip i=0
@@ -294,6 +303,7 @@ do_online() {
 
 # 立即重新认证（不碰接口，避免 ifup 带来的射频抖动）
 do_relogin() {
+	require_enabled || return 0
 	local up ip
 	rm -f "$PAUSE_FILE" 2>/dev/null
 	clear_fails

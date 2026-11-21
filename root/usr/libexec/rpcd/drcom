@@ -286,30 +286,25 @@ read_mac() {
 }
 
 method_kick() {
-	local mac dev
+	local mac
 	mac=$(read_mac) || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
 
 	mkdir -p "$STATE_DIR" 2>/dev/null
 
-	# 1) 无线设备：直接踢下线
-	for dev in $(ls /sys/class/net 2>/dev/null); do
-		[ -e "/sys/class/net/$dev/phy80211" ] || continue
-		iw dev "$dev" info 2>/dev/null | grep -q 'type AP' || continue
-		iw dev "$dev" station dump 2>/dev/null | grep -q "^Station $mac " \
-			&& iw dev "$dev" station del "$mac" >/dev/null 2>&1
-	done
-
-	# 2) 记入阻断名单并下发防火墙规则
+	# 只做 L2 阻断，不发 deauth。
+	# 发 deauth 虽然看起来"断得更彻底"，但设备重新关联后流量仍被丢，DHCP/连通性检查失败，
+	# 客户端会进入退避，解除后要等它自己重试才恢复（实测 >25 秒）。
+	# 只丢包则设备保持关联，解除瞬间流量就通。
 	: > "$BLOCK.tmp"
 	[ -f "$BLOCK" ] && awk -v m="$mac" '$1 != m' "$BLOCK" >> "$BLOCK.tmp"
 	printf '%s %s\n' "$mac" "$(( $(date +%s) + BLOCK_SECS ))" >> "$BLOCK.tmp"
 	mv "$BLOCK.tmp" "$BLOCK"
 	chmod 600 "$BLOCK" 2>/dev/null
 	nft_sync_blocks
-	logger -t drcom-portal "[操作] 已断开设备 $mac，阻断 $((BLOCK_SECS / 60)) 分钟" 2>/dev/null
+	logger -t drcom-portal "[操作] 已阻断设备 $mac 的网络访问，$((BLOCK_SECS / 60)) 分钟后自动解除" 2>/dev/null
 
 	json_init
-	json_add_string message "已断开该设备，并阻断其流量 $((BLOCK_SECS / 60)) 分钟"
+	json_add_string message "已断开该设备，阻断其流量 $((BLOCK_SECS / 60)) 分钟（解除后立即恢复）"
 	json_dump
 }
 
@@ -342,6 +337,33 @@ method_action() {
 	json_dump
 }
 
+# 总开关：整插件启用/停用。停用后守护进程不运行、不探测、不认证、不动上行接口，
+# 方便接 USB CPE 等其它上行时避免两边互相抢。
+method_master() {
+	mkdir -p "$STATE_DIR" 2>/dev/null
+
+	if [ "$1" = "on" ]; then
+		uci -q set drcom.main.enabled='1'
+		uci -q commit drcom
+		/etc/init.d/drcom restart >/dev/null 2>&1
+		logger -t drcom-portal "[操作] 插件已启用" 2>/dev/null
+		json_init
+		json_add_string message "插件已启用"
+		json_dump
+	else
+		uci -q set drcom.main.enabled='0'
+		uci -q commit drcom
+		/etc/init.d/drcom stop >/dev/null 2>&1
+		# 停用就不要再拦着任何设备了
+		: > "$BLOCK"
+		nft_sync_blocks
+		logger -t drcom-portal "[操作] 插件已停用" 2>/dev/null
+		json_init
+		json_add_string message "插件已停用（不再探测、认证或改动上行接口）"
+		json_dump
+	fi
+}
+
 case "$1" in
 	list)
 		json_init
@@ -355,6 +377,8 @@ case "$1" in
 		json_add_object restart; json_close_object
 		json_add_object kick;    json_close_object
 		json_add_object unkick;  json_close_object
+		json_add_object start;   json_close_object
+		json_add_object stop;    json_close_object
 		json_dump
 		;;
 	call)
@@ -369,6 +393,8 @@ case "$1" in
 			restart) method_action restart ;;
 			kick)    method_kick ;;
 			unkick)  method_unkick ;;
+			start)   method_master on ;;
+			stop)    method_master off ;;
 			*) json_init; json_add_string message "unknown method"; json_dump ;;
 		esac
 		;;

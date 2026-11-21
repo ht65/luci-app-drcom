@@ -3,6 +3,9 @@
 # 这里只发信号、不整体重启服务：重启要走 procd 的停机流程，既慢又会打断状态更新。
 [ "$ACTION" = "ifup" ] || exit 0
 
+# 插件被总开关停用时什么都不做（例如改用 USB CPE 上行时，避免两边互相干扰）
+[ "$(uci -q get drcom.main.enabled)" = "1" ] || exit 0
+
 case "$INTERFACE" in
 	wan|wwan) /usr/sbin/drcom-portal wake ;;
 esac

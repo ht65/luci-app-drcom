@@ -16,6 +16,8 @@ var callRelogin = rpc.declare({ object: 'drcom', method: 'relogin', expect: { ''
 var callRestart = rpc.declare({ object: 'drcom', method: 'restart', expect: { '': {} } });
 var callKick    = rpc.declare({ object: 'drcom', method: 'kick',    params: [ 'mac' ], expect: { '': {} } });
 var callUnkick  = rpc.declare({ object: 'drcom', method: 'unkick',  params: [ 'mac' ], expect: { '': {} } });
+var callStart   = rpc.declare({ object: 'drcom', method: 'start',   expect: { '': {} } });
+var callStop    = rpc.declare({ object: 'drcom', method: 'stop',    expect: { '': {} } });
 
 var TERM_NAMES = {
 	'0': '未知',
@@ -54,6 +56,9 @@ var CSS = [
 	'.drcom-tabs{display:flex;gap:6px;margin:0 0 8px}',
 	'.drcom-tab{font-size:12px;padding:2px 10px;border-radius:10px;border:1px solid rgba(128,128,128,.35);background:transparent;cursor:pointer;color:inherit}',
 	'.drcom-tab-on{background:rgba(90,110,190,.14);border-color:rgba(90,110,190,.45)}',
+	// 总开关停用时，让下面这些操作整体变灰且不可点
+	'.drcom-off .cbi-button,.drcom-off .drcom-tab{opacity:.45;pointer-events:none}',
+	'.drcom-master{margin:0}',
 	'.drcom-form .cbi-section{padding-bottom:12px}',
 	'@media (max-width:560px){.drcom-kv-l{flex:0 0 100%;max-width:none}}'
 ].join('\n');
@@ -111,6 +116,38 @@ return view.extend({
 		var vError   = E('span', {}, '—');
 		var warnEl   = E('p', { 'class': 'drcom-warn', 'style': 'display:none' }, '');
 
+		// 总开关状态（由 applyStatus 更新）
+		var masterOn = true;
+		var masterBadge = E('span', { 'class': 'drcom-dev-tag drcom-tag-on' }, '运行中');
+		var masterBtn = E('button', { 'class': 'cbi-button cbi-button-reset' }, '停用插件');
+		var actionsBox = null;   // 在下面创建后赋给，用于停用时置灰
+		var devicesBox = null;
+		masterBtn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			masterBtn.disabled = true;
+			var fn = masterOn ? callStop : callStart;
+
+			fn().then(function(r) {
+				ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已执行'));
+				return refresh(true);
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, '操作失败：' + e.message));
+			}).finally(function() {
+				masterBtn.disabled = false;
+			});
+		});
+
+		function setMasterUi() {
+			masterBadge.textContent = masterOn ? '运行中' : '已停用';
+			masterBadge.className = 'drcom-dev-tag ' + (masterOn ? 'drcom-tag-on' : '');
+			masterBtn.textContent = masterOn ? '停用插件' : '启用插件';
+			masterBtn.className = 'cbi-button ' + (masterOn ? 'cbi-button-reset' : 'cbi-button-apply');
+			if (actionsBox)
+				actionsBox.classList.toggle('drcom-off', !masterOn);
+			if (devicesBox)
+				devicesBox.classList.toggle('drcom-off', !masterOn);
+		}
+
 		function applyStatus(s) {
 			// 首屏还没拿到真实状态时不要把 badge 写成「服务未运行」，那会误报成故障
 			if (!s || s.running === undefined)
@@ -129,7 +166,7 @@ return view.extend({
 
 			// 「已禁用」优先于「服务未运行」：禁用时服务本来就不会启动，
 			// 先判 running 的话用户只会看到一片红色错误。
-			if (!enabled)          { text = '已禁用';                  color = '#616161'; }
+			if (!enabled)          { text = '已停用 · 插件不工作';       color = '#616161'; }
 			else if (!running)     { text = '服务未运行';              color = '#c62828'; }
 			else if (!configured)  { text = '未配置账号';              color = '#ef6c00'; }
 			else if (offline)      { text = '已下线 · 上行已断开';     color = '#616161'; }
@@ -162,6 +199,10 @@ return view.extend({
 			else {
 				warnEl.style.display = 'none';
 			}
+
+			// 总开关：控制下方操作区与设备操作是否可用
+			masterOn = enabled;
+			setMasterUi();
 		}
 
 		function applyLog(lg) {
@@ -184,7 +225,8 @@ return view.extend({
 		function kickDevice(x) {
 			var label = x.name || x.ip || x.mac;
 			var ok = window.confirm('断开「' + label + '」？\n\n'
-				+ '会立即把它踢下线，并阻断它的流量 5 分钟（5 分钟后自动解除）。\n'
+				+ '会阻断它的网络访问 5 分钟（到期自动解除，也可以点「解除」立即恢复）。\n'
+				+ '设备可能仍显示已连接 WiFi，但无法上网。\n'
 				+ '如果这是你正在用的这台设备，阻断期间将无法访问本页面。');
 			if (!ok)
 				return;
@@ -324,6 +366,15 @@ return view.extend({
 			return btn;
 		}
 
+		var masterBox = section([
+			E('span', {}, '插件总开关'), ' ', masterBadge
+		], [
+			E('div', { 'class': 'drcom-btns drcom-master' }, [ masterBtn ]),
+			E('p', { 'class': 'drcom-note' },
+				'停用后插件完全停止：不再探测、不再认证、不会去动上行接口，也不会在接口拨起时做任何事。'
+				+ '改用 USB CPE 等其它上行时请关掉，避免两个网络互相抢。')
+		]);
+
 		var statusBox = section([
 			E('span', {}, '当前状态'), ' ', badge
 		], [
@@ -337,7 +388,7 @@ return view.extend({
 			warnEl
 		]);
 
-		var actions = section('手动操作', [
+		actionsBox = section('手动操作', [
 			E('div', { 'class': 'drcom-btns' }, [
 				actionBtn('上线（拉起上行）', 'cbi-button-apply', callOnline),
 				actionBtn('立即重新认证', 'cbi-button-action', callRelogin),
@@ -359,12 +410,12 @@ return view.extend({
 			refresh(true).finally(function() { devReload.disabled = false; });
 		});
 
-		var devicesBox = section([
+		devicesBox = section([
 			E('span', {}, '当前连接设备'), ' ', devCount, ' ', devReload
 		], [
 			devList,
 			E('p', { 'class': 'drcom-note' },
-				'「断开」会把设备踢下线并阻断其流量 5 分钟（自动解除），阻断期间无法访问本页面，'
+				'「断开」会阻断该设备的网络访问 5 分钟（到期自动解除，点「解除」立即恢复），期间设备可能仍显示已连接 WiFi。'
 				+ '请勿对自己正在使用的设备操作。离线状态以无线连接、ARP 邻居为准。')
 		]);
 
@@ -404,11 +455,7 @@ return view.extend({
 		s.anonymous = true;
 		s.addremove = false;
 
-		var o = s.option(form.Flag, 'enabled', _('启用认证'), _('关闭后停止自动认证。'));
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'username', _('账号'));
+		var o = s.option(form.Value, 'username', _('账号'));
 		o.placeholder = _('校园网账号');
 		o.rmempty = false;
 
@@ -471,8 +518,9 @@ return view.extend({
 		return Promise.resolve(m.render()).then(function(node) {
 			return E([
 				E('style', {}, CSS),
+				masterBox,
 				statusBox,
-				actions,
+				actionsBox,
 				devicesBox,
 				// 包一层，好给表单卡片补底部留白（见 CSS 里的 .drcom-form）
 				E('div', { 'class': 'drcom-form' }, node),
