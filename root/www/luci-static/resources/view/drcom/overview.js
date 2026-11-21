@@ -7,12 +7,15 @@
 'require ui';
 
 var callStatus  = rpc.declare({ object: 'drcom', method: 'status',  expect: { '': {} } });
-var callLog     = rpc.declare({ object: 'drcom', method: 'log',     expect: { '': {} } });
+var callLogAuto = rpc.declare({ object: 'drcom', method: 'log',     expect: { '': {} } });
+var callLogOp   = rpc.declare({ object: 'drcom', method: 'oplog',   expect: { '': {} } });
 var callDevices = rpc.declare({ object: 'drcom', method: 'devices', expect: { '': {} } });
 var callOnline  = rpc.declare({ object: 'drcom', method: 'online',  expect: { '': {} } });
 var callOffline = rpc.declare({ object: 'drcom', method: 'offline', expect: { '': {} } });
 var callRelogin = rpc.declare({ object: 'drcom', method: 'relogin', expect: { '': {} } });
 var callRestart = rpc.declare({ object: 'drcom', method: 'restart', expect: { '': {} } });
+var callKick    = rpc.declare({ object: 'drcom', method: 'kick',    params: [ 'mac' ], expect: { '': {} } });
+var callUnkick  = rpc.declare({ object: 'drcom', method: 'unkick',  params: [ 'mac' ], expect: { '': {} } });
 
 var TERM_NAMES = {
 	'0': '未知',
@@ -36,16 +39,21 @@ var CSS = [
 	'.drcom-note{margin:10px 0 0;font-size:12px;opacity:.7;line-height:1.6}',
 	'.drcom-warn{margin:10px 0 0;font-size:12px;line-height:1.6;color:#ef6c00}',
 	'.drcom-log{max-height:300px;overflow:auto;padding:10px;margin:0;background:rgba(127,127,127,.1);border-radius:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-all}',
-	// 设备列表：flex-wrap，窄屏自动折行
 	'.drcom-dev{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;padding:7px 0;border-bottom:1px solid rgba(128,128,128,.18);font-size:13px}',
 	'.drcom-dev:last-child{border-bottom:none}',
 	'.drcom-dev-name{flex:1 1 130px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 	'.drcom-dev-ip{flex:0 0 auto;opacity:.8;font-variant-numeric:tabular-nums}',
 	'.drcom-dev-mac{flex:0 0 auto;opacity:.5;font-size:11px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}',
 	'.drcom-dev-tag{flex:0 0 auto;font-size:11px;padding:1px 7px;border-radius:9px;background:rgba(128,128,128,.14);white-space:nowrap}',
-	'.drcom-dev-off{opacity:.45}',
+	'.drcom-tag-on{background:rgba(46,125,50,.16);color:#2e7d32}',
+	'.drcom-tag-block{background:rgba(198,40,40,.14);color:#c62828}',
+	'.drcom-dev-away{opacity:.45}',
+	'.drcom-dev-btn{flex:0 0 auto;padding:0 8px !important;min-height:24px !important;line-height:22px !important;font-size:12px !important}',
 	'.drcom-dev-count{font-size:12px;opacity:.65}',
-	// 表单卡片补底部留白，否则最后一个输入框的底边框正好压在卡片底边上
+	'.drcom-refresh{font-size:12px !important;padding:0 10px !important;min-height:24px !important;line-height:22px !important}',
+	'.drcom-tabs{display:flex;gap:6px;margin:0 0 8px}',
+	'.drcom-tab{font-size:12px;padding:2px 10px;border-radius:10px;border:1px solid rgba(128,128,128,.35);background:transparent;cursor:pointer;color:inherit}',
+	'.drcom-tab-on{background:rgba(90,110,190,.14);border-color:rgba(90,110,190,.45)}',
 	'.drcom-form .cbi-section{padding-bottom:12px}',
 	'@media (max-width:560px){.drcom-kv-l{flex:0 0 100%;max-width:none}}'
 ].join('\n');
@@ -65,6 +73,18 @@ function kv(label, valueNode) {
 	]);
 }
 
+// 相对时间：最后在线多久之前
+function relTime(ts) {
+	var d = Math.floor(Date.now() / 1000) - ts;
+	if (d < 60)
+		return '1 分钟内';
+	if (d < 3600)
+		return Math.floor(d / 60) + ' 分钟前';
+	if (d < 86400)
+		return Math.floor(d / 3600) + ' 小时前';
+	return Math.floor(d / 86400) + ' 天前';
+}
+
 return view.extend({
 	load: function() {
 		// 这里只读配置。状态与日志放到 render 之后串行拉取：
@@ -76,6 +96,7 @@ return view.extend({
 	render: function() {
 		var tick = 0;          // 轮询计数，用来降低日志/设备列表刷新频率
 		var lastLog = null;    // 上一次日志内容，没变就不重绘（否则会把滚动位置拽回去）
+		var logKind = 'auto';  // 'auto' 自动认证日志 / 'op' 手动操作日志
 
 		var badge = E('span', {
 			'style': 'display:inline-block;padding:2px 10px;border-radius:10px;color:#fff;font-size:12px;background:#666'
@@ -160,6 +181,31 @@ return view.extend({
 			logPre.scrollTop = atBottom ? logPre.scrollHeight : prevTop;
 		}
 
+		function kickDevice(x) {
+			var label = x.name || x.ip || x.mac;
+			var ok = window.confirm('断开「' + label + '」？\n\n'
+				+ '会立即把它踢下线，并阻断它的流量 5 分钟（5 分钟后自动解除）。\n'
+				+ '如果这是你正在用的这台设备，阻断期间将无法访问本页面。');
+			if (!ok)
+				return;
+
+			callKick(x.mac).then(function(r) {
+				ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已断开'));
+				return refresh(true);
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, '操作失败：' + e.message));
+			});
+		}
+
+		function unkickDevice(x) {
+			callUnkick(x.mac).then(function(r) {
+				ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已解除阻断'));
+				return refresh(true);
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, '操作失败：' + e.message));
+			});
+		}
+
 		function applyDevices(d) {
 			var list = (d && d.devices) || [];
 
@@ -179,29 +225,70 @@ return view.extend({
 			});
 			devCount.textContent = online + ' / ' + list.length + ' 台在线';
 
-			// 在线的排前面
+			// 在线的排前面，其次阻断的，最后离线的
 			list.sort(function(a, b) {
-				return (parseInt(b.online) || 0) - (parseInt(a.online) || 0);
+				var sa = (parseInt(a.online) || 0) * 2 + (parseInt(a.blocked) || 0);
+				var sb = (parseInt(b.online) || 0) * 2 + (parseInt(b.blocked) || 0);
+				return sb - sa;
 			});
 
 			list.forEach(function(x) {
 				var on = parseInt(x.online) == 1;
 				var wifi = parseInt(x.wireless) == 1;
+				var blocked = parseInt(x.blocked) == 1;
+				var left = parseInt(x.block_left) || 0;
+				var seen = parseInt(x.last_seen) || 0;
 
-				devList.appendChild(E('div', { 'class': 'drcom-dev' + (on ? '' : ' drcom-dev-off') }, [
+				var statusText, statusCls;
+				if (blocked) {
+					statusText = '已阻断 ' + Math.max(1, Math.ceil(left / 60)) + ' 分钟';
+					statusCls = 'drcom-tag-block';
+				}
+				else if (on) {
+					statusText = '在线';
+					statusCls = 'drcom-tag-on';
+				}
+				else {
+					statusText = seen > 0 ? ('离线 · ' + relTime(seen)) : '离线';
+					statusCls = '';
+				}
+
+				var actBtn = blocked
+					? E('button', { 'class': 'cbi-button cbi-button-action drcom-dev-btn' }, '解除')
+					: E('button', { 'class': 'cbi-button cbi-button-reset drcom-dev-btn' }, '断开');
+
+				// 直接用 addEventListener，不依赖 E() 对事件属性的处理
+				actBtn.addEventListener('click', function(ev) {
+					ev.preventDefault();
+					if (blocked)
+						unkickDevice(x);
+					else
+						kickDevice(x);
+				});
+
+				devList.appendChild(E('div', {
+					'class': 'drcom-dev' + ((!on && !blocked) ? ' drcom-dev-away' : '')
+				}, [
 					E('span', { 'class': 'drcom-dev-name' }, x.name || '未知设备'),
 					E('span', { 'class': 'drcom-dev-ip' }, x.ip || '—'),
 					E('span', { 'class': 'drcom-dev-mac' }, x.mac || ''),
-					E('span', { 'class': 'drcom-dev-tag' },
-						(wifi ? 'WiFi' : '有线') + (on ? '' : ' · 离线'))
+					E('span', { 'class': 'drcom-dev-tag' }, wifi ? 'WiFi' : '有线'),
+					E('span', { 'class': 'drcom-dev-tag ' + statusCls }, statusText),
+					actBtn
 				]));
 			});
 		}
 
+		function fetchLog() {
+			return (logKind == 'op' ? callLogOp() : callLogAuto())
+				.then(applyLog).catch(function() {});
+		}
+
 		// 严格串行：先状态，再设备、最后日志。并发 RPC 在 LuCI 26 上会卡住页面。
 		// 设备列表放在日志前面：日志要读 80 行，慢的时候会让设备区一直停在「加载中」。
-		function refresh() {
-			var wantSlow = (tick % SLOW_EVERY) === 0;
+		// force=true 用于手动刷新与按钮操作后立刻拉一遍。
+		function refresh(force) {
+			var wantSlow = (force === true) || (tick % SLOW_EVERY) === 0;
 			tick++;
 
 			return callStatus().then(function(st) {
@@ -212,9 +299,7 @@ return view.extend({
 			}).then(function() {
 				if (!wantSlow)
 					return null;
-				return callDevices().then(applyDevices).catch(function() {}).then(function() {
-					return callLog().then(applyLog).catch(function() {});
-				});
+				return callDevices().then(applyDevices).catch(function() {}).then(fetchLog);
 			});
 		}
 
@@ -227,7 +312,8 @@ return view.extend({
 
 				return fn().then(function(r) {
 					ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已执行'));
-					return refresh();
+					// 操作后立刻刷新，日志与设备列表不用等下一个 15 秒周期
+					return refresh(true);
 				}).catch(function(e) {
 					ui.addNotification(null, E('p', {}, '操作失败：' + e.message));
 				}).finally(function() {
@@ -266,17 +352,50 @@ return view.extend({
 		var devCount = E('span', { 'class': 'drcom-dev-count' }, '…');
 		var devList = E('div', {}, E('p', { 'class': 'drcom-note' }, '（加载中…）'));
 
+		var devReload = E('button', { 'class': 'cbi-button cbi-button-action drcom-refresh' }, '刷新');
+		devReload.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			devReload.disabled = true;
+			refresh(true).finally(function() { devReload.disabled = false; });
+		});
+
 		var devicesBox = section([
-			E('span', {}, '当前连接设备'), ' ', devCount
+			E('span', {}, '当前连接设备'), ' ', devCount, ' ', devReload
 		], [
 			devList,
 			E('p', { 'class': 'drcom-note' },
-				'列表合并了 DHCP 租约、LAN 邻居表和无线连接列表；「离线」表示还剩租约但当前不在线。')
+				'「断开」会把设备踢下线并阻断其流量 5 分钟（自动解除），阻断期间无法访问本页面，'
+				+ '请勿对自己正在使用的设备操作。离线状态以无线连接、ARP 邻居为准。')
 		]);
 
 		var logPre = E('pre', { 'class': 'drcom-log' }, '（加载中…）');
 
-		var logBox = section('实时日志', [ logPre ]);
+		var tabAuto = E('button', { 'class': 'drcom-tab drcom-tab-on' }, '自动认证');
+		var tabOp = E('button', { 'class': 'drcom-tab' }, '手动操作');
+
+		function renderTabs() {
+			tabAuto.className = 'drcom-tab' + (logKind == 'auto' ? ' drcom-tab-on' : '');
+			tabOp.className = 'drcom-tab' + (logKind == 'op' ? ' drcom-tab-on' : '');
+		}
+
+		function switchLog(kind) {
+			if (kind == logKind)
+				return;
+			logKind = kind;
+			lastLog = null;
+			renderTabs();
+			logPre.textContent = '（切换中…）';
+			// 切日志只重拉日志，不必动状态与设备
+			fetchLog();
+		}
+
+		tabAuto.addEventListener('click', function(ev) { ev.preventDefault(); switchLog('auto'); });
+		tabOp.addEventListener('click', function(ev) { ev.preventDefault(); switchLog('op'); });
+
+		var logBox = section('实时日志', [
+			E('div', { 'class': 'drcom-tabs' }, [ tabAuto, tabOp ]),
+			logPre
+		]);
 
 		var m = new form.Map('drcom', _('Dr.COM 校园网认证'),
 			_('路由器自动完成校园网 Portal 认证，供接入本机的设备共享上网。修改后保存，最多 60 秒自动生效；需要立刻生效请点上方「重启服务」。'));
@@ -347,7 +466,7 @@ return view.extend({
 
 		poll.add(refresh, 5);
 		poll.start();
-		refresh();
+		refresh(true);
 
 		return Promise.resolve(m.render()).then(function(node) {
 			return E([

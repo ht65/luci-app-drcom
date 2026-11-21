@@ -4,6 +4,9 @@
 
 STATE=/var/run/drcom/state
 STATE_DIR=/var/run/drcom
+META="$STATE_DIR/devmeta"	# mac type last_seen（记住设备是有线还是无线）
+BLOCK="$STATE_DIR/blocked"	# mac 解封时间戳
+BLOCK_SECS=300			# 手动断开后阻断多久（秒）
 
 # 取 uci 值；缺失时用和 drcom-portal 一致的默认值，
 # 避免界面显示（例如「已禁用」）与运行时实际行为对不上。
@@ -16,6 +19,51 @@ cfg() {
 		printf '%s' "$2"
 	fi
 }
+
+# ---------- 阻断相关 ----------
+
+nft_table_init() {
+	nft list table bridge drcom_block >/dev/null 2>&1 && return 0
+	nft add table bridge drcom_block 2>/dev/null || return 1
+	nft add set bridge drcom_block blocked '{ type ether_addr; }' 2>/dev/null || return 1
+	nft add chain bridge drcom_block input '{ type filter hook input priority -10; policy accept; }' 2>/dev/null
+	nft add chain bridge drcom_block forward '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null
+	nft 'add rule bridge drcom_block input ether saddr @blocked drop' 2>/dev/null
+	nft 'add rule bridge drcom_block forward ether saddr @blocked drop' 2>/dev/null
+	return 0
+}
+
+# 让内核里的阻断集合与 BLOCK 文件保持一致（文件为空就把表删掉，不留残留）
+nft_sync_blocks() {
+	local mac exp
+	if [ ! -s "$BLOCK" ]; then
+		nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
+		return 0
+	fi
+	nft_table_init || return 1
+	nft flush set bridge drcom_block blocked 2>/dev/null
+	while read -r mac exp; do
+		[ -n "$mac" ] && nft add element bridge drcom_block blocked "{ $mac }" 2>/dev/null
+	done < "$BLOCK"
+	return 0
+}
+
+# 清掉过期的阻断记录
+block_purge() {
+	local now
+	now=$(date +%s)
+	[ -f "$BLOCK" ] || return 0
+	awk -v n="$now" '$2 > n' "$BLOCK" > "$BLOCK.tmp" 2>/dev/null
+	mv "$BLOCK.tmp" "$BLOCK" 2>/dev/null
+	chmod 600 "$BLOCK" 2>/dev/null
+}
+
+# MAC 是否在阻断名单里 -> 输出剩余秒数，未阻断输出空
+block_left() {
+	awk -v m="$1" -v n="$(date +%s)" '$1 == m && $2 > n { print $2 - n; exit }' "$BLOCK" 2>/dev/null
+}
+
+# ---------- 状态 ----------
 
 method_status() {
 	local running=0 online=0 paused=0 hold=0 fails=0 ip="" uplink="" account=""
@@ -56,8 +104,16 @@ method_status() {
 	json_dump
 }
 
+# ---------- 日志（自动认证 / 手动操作分开） ----------
+
 method_log() {
-	logread -e drcom 2>/dev/null | tail -n 80 > /tmp/.drcom-log.$$
+	local pat
+	case "$1" in
+		op) pat='[操作]' ;;
+		*)  pat='[自动]' ;;
+	esac
+
+	logread -e drcom 2>/dev/null | grep -F "$pat" | tail -n 80 > /tmp/.drcom-log.$$
 	json_init
 	json_add_array lines
 	while IFS= read -r line; do
@@ -68,41 +124,47 @@ method_log() {
 	json_dump
 }
 
-# 当前连接设备：合并 DHCP 租约、LAN 邻居表和无线 station 列表
-method_devices() {
-	local wl="$STATE_DIR/.wlmacs" nb="$STATE_DIR/.neigh" seen="$STATE_DIR/.seen"
-	local landev mac ip host exp cid on wifi nip n=0 d
+# ---------- 设备列表 ----------
 
-	landev=$(uci -q get network.lan.device)
-	[ -n "$landev" ] || landev=br-lan
-
-	mkdir -p "$STATE_DIR" 2>/dev/null
-
-	# 无线客户端 MAC：取所有 AP 模式接口的 station 列表
-	: > "$wl"
+# 找出所有 AP 模式接口上的 station -> "mac" 每行一个
+list_stations() {
+	local d
 	for d in $(ls /sys/class/net 2>/dev/null); do
 		[ -e "/sys/class/net/$d/phy80211" ] || continue
 		iw dev "$d" info 2>/dev/null | grep -q 'type AP' || continue
 		iw dev "$d" station dump 2>/dev/null \
 			| sed -n 's/^Station \([0-9A-Fa-f:]*\).*/\1/p' \
-			| tr 'A-F' 'a-f' >> "$wl"
+			| tr 'A-F' 'a-f'
 	done
+}
 
-	# LAN 侧邻居表（有 lladdr 且不是 FAILED 视为在线），输出 "mac ip"。
-	# 注意：`ip neigh show dev X` 的输出里不带 "dev X" 列，直接 `ip neigh show` 才有，
-	# 所以两种格式都要能解析。
+method_devices() {
+	local wl="$STATE_DIR/.wl" nb="$STATE_DIR/.nb" ne="$STATE_DIR/.meta.new"
+	local landev mac ip host exp cid on wifi nip state left seen n=0 now
+
+	now=$(date +%s)
+
+	landev=$(uci -q get network.lan.device)
+	[ -n "$landev" ] || landev=br-lan
+
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	block_purge
+	nft_sync_blocks
+
+	list_stations > "$wl"
+
+	# 邻居表：mac ip state（只要 IPv4，且跳过 FAILED —— 那表示已经探测不到了）
 	ip neigh show dev "$landev" 2>/dev/null \
-		| grep -v FAILED \
-		| sed -n \
-			-e 's/^\([0-9.]*\) dev [^ ]* lladdr \([0-9A-Fa-f:]*\).*/\2 \1/p' \
-			-e 's/^\([0-9.]*\) lladdr \([0-9A-Fa-f:]*\).*/\2 \1/p' \
-		| tr 'A-F' 'a-f' > "$nb"
+		| awk '{ if ($1 ~ /:/ || $NF == "FAILED") next;
+			 ip = $1; mac = ""; for (i = 1; i <= NF; i++) if ($i == "lladdr") mac = $(i + 1);
+			 if (mac != "") printf "%s %s %s\n", tolower(mac), ip, $NF }' > "$nb"
+
+	: > "$ne"
 
 	json_init
 	json_add_array devices
-	: > "$seen"
 
-	# 先列 DHCP 租约（带主机名）
+	# 先按 DHCP 租约列出（有主机名）
 	while read -r exp mac ip host cid; do
 		[ -n "$mac" ] || continue
 		mac=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
@@ -110,46 +172,161 @@ method_devices() {
 
 		nip=$(awk -v m="$mac" '$1 == m { print $2; exit }' "$nb")
 		[ -n "$nip" ] && ip="$nip"
-		on=0
-		[ -n "$nip" ] && on=1
-		wifi=0
-		grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
 
-		printf '%s\n' "$mac" >> "$seen"
+		# 无线还是有线：当前在 station 列表里就是无线；否则沿用历史记录
+		if grep -qx "$mac" "$wl" 2>/dev/null; then
+			wifi=1
+		else
+			wifi=0
+			case "$(awk -v m="$mac" '$1 == m { print $2; exit }' "$META" 2>/dev/null)" in
+				w) wifi=1 ;;
+			esac
+		fi
+
+		if [ "$wifi" = "1" ]; then
+			# 无线设备以 station 是否存在为准：断开后立刻判定离线
+			grep -qx "$mac" "$wl" 2>/dev/null && on=1 || on=0
+		else
+			state=$(awk -v m="$mac" '$1 == m { print $3; exit }' "$nb")
+			case "$state" in
+				REACHABLE|DELAY|PROBE) on=1 ;;
+				*)
+					# 邻居表是 STALE 或没有记录：发一个包触发 ARP 解析，再看状态
+					# （主机若还在，ARP 会成功 -> REACHABLE；不在则 FAILED）
+					ping -c 1 -W 1 "$ip" >/dev/null 2>&1
+					state=$(ip neigh show "$ip" dev "$landev" 2>/dev/null | awk '{ print $NF }')
+					case "$state" in
+						REACHABLE|DELAY|PROBE) on=1 ;;
+						*) on=0 ;;
+					esac
+					;;
+			esac
+		fi
+
+		left=$(block_left "$mac")
+		[ -n "$left" ] && on=0
+
+		if [ "$on" = "1" ]; then
+			seen=$now
+		else
+			seen=$(awk -v m="$mac" '$1 == m { print $3; exit }' "$META" 2>/dev/null)
+			[ -n "$seen" ] || seen=0
+		fi
+		printf '%s %s %s\n' "$mac" "$( [ "$wifi" = 1 ] && echo w || echo e )" "$seen" >> "$ne"
+
 		json_add_object
-		json_add_string name     "$host"
-		json_add_string ip       "$ip"
-		json_add_string mac      "$mac"
-		json_add_int    online   "$on"
-		json_add_int    wireless "$wifi"
+		json_add_string name      "$host"
+		json_add_string ip        "$ip"
+		json_add_string mac       "$mac"
+		json_add_int    online    "$on"
+		json_add_int    wireless  "$wifi"
+		json_add_int    blocked   "$( [ -n "$left" ] && echo 1 || echo 0 )"
+		json_add_int    block_left "${left:-0}"
+		json_add_string last_seen "$seen"
 		json_close_object
 		n=$((n + 1))
 	done < /tmp/dhcp.leases
 
 	# 再补上邻居表里有、但没有 DHCP 租约的设备（静态 IP）
-	if [ -s "$nb" ]; then
-		while read -r mac ip; do
-			[ -n "$mac" ] || continue
-			grep -qx "$mac" "$seen" 2>/dev/null && continue
-			wifi=0
-			grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
-			printf '%s\n' "$mac" >> "$seen"
-			json_add_object
-			json_add_string name     ""
-			json_add_string ip       "$ip"
-			json_add_string mac      "$mac"
-			json_add_int    online   1
-			json_add_int    wireless "$wifi"
-			json_close_object
-			n=$((n + 1))
-		done < "$nb"
-	fi
+	while read -r mac ip state; do
+		[ -n "$mac" ] || continue
+		grep -q "^$mac " "$ne" 2>/dev/null && continue
+		wifi=0
+		grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
+		case "$state" in
+			REACHABLE|DELAY|PROBE) on=1 ;;
+			*) on=0 ;;
+		esac
+		left=$(block_left "$mac")
+		[ -n "$left" ] && on=0
+		[ "$on" = "1" ] && seen=$now || seen=0
+		printf '%s %s %s\n' "$mac" "$( [ "$wifi" = 1 ] && echo w || echo e )" "$seen" >> "$ne"
+		json_add_object
+		json_add_string name      ""
+		json_add_string ip        "$ip"
+		json_add_string mac       "$mac"
+		json_add_int    online    "$on"
+		json_add_int    wireless  "$wifi"
+		json_add_int    blocked   "$( [ -n "$left" ] && echo 1 || echo 0 )"
+		json_add_int    block_left "${left:-0}"
+		json_add_string last_seen "$seen"
+		json_close_object
+		n=$((n + 1))
+	done < "$nb"
 
 	json_close_array
 	json_add_int count "$n"
 	json_dump
 
-	rm -f "$wl" "$nb" "$seen" 2>/dev/null
+	# 合并历史记录（暂时不在线的设备也要记住它是不是无线）
+	if [ -f "$META" ]; then
+		while read -r mac wifi seen; do
+			[ -n "$mac" ] || continue
+			grep -q "^$mac " "$ne" 2>/dev/null || printf '%s %s %s\n' "$mac" "$wifi" "$seen" >> "$ne"
+		done < "$META"
+	fi
+	mv "$ne" "$META" 2>/dev/null
+	chmod 600 "$META" 2>/dev/null
+
+	rm -f "$wl" "$nb" 2>/dev/null
+}
+
+# ---------- 断开设备 ----------
+
+# 读 rpcd 通过 stdin 传来的 JSON 参数
+read_mac() {
+	local req mac
+	IFS= read -r req 2>/dev/null
+	mac=$(printf '%s' "$req" | jsonfilter -e '@.mac' 2>/dev/null)
+	mac=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
+	case "$mac" in
+		''|*[!0-9a-f:]*) printf '' ; return 1 ;;
+	esac
+	printf '%s' "$mac"
+}
+
+method_kick() {
+	local mac dev
+	mac=$(read_mac) || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
+
+	mkdir -p "$STATE_DIR" 2>/dev/null
+
+	# 1) 无线设备：直接踢下线
+	for dev in $(ls /sys/class/net 2>/dev/null); do
+		[ -e "/sys/class/net/$dev/phy80211" ] || continue
+		iw dev "$dev" info 2>/dev/null | grep -q 'type AP' || continue
+		iw dev "$dev" station dump 2>/dev/null | grep -q "^Station $mac " \
+			&& iw dev "$dev" station del "$mac" >/dev/null 2>&1
+	done
+
+	# 2) 记入阻断名单并下发防火墙规则
+	: > "$BLOCK.tmp"
+	[ -f "$BLOCK" ] && awk -v m="$mac" '$1 != m' "$BLOCK" >> "$BLOCK.tmp"
+	printf '%s %s\n' "$mac" "$(( $(date +%s) + BLOCK_SECS ))" >> "$BLOCK.tmp"
+	mv "$BLOCK.tmp" "$BLOCK"
+	chmod 600 "$BLOCK" 2>/dev/null
+	nft_sync_blocks
+	logger -t drcom-portal "[操作] 已断开设备 $mac，阻断 $((BLOCK_SECS / 60)) 分钟" 2>/dev/null
+
+	json_init
+	json_add_string message "已断开该设备，并阻断其流量 $((BLOCK_SECS / 60)) 分钟"
+	json_dump
+}
+
+method_unkick() {
+	local mac
+	mac=$(read_mac) || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
+
+	: > "$BLOCK.tmp"
+	[ -f "$BLOCK" ] && awk -v m="$mac" '$1 != m' "$BLOCK" >> "$BLOCK.tmp"
+	mv "$BLOCK.tmp" "$BLOCK"
+	chmod 600 "$BLOCK" 2>/dev/null
+	nft_sync_blocks
+	logger -t drcom-portal "[操作] 已解除设备 $mac 的阻断" 2>/dev/null
+
+	json_init
+	json_add_string message "已解除阻断"
+	json_dump
 }
 
 method_action() {
@@ -170,22 +347,28 @@ case "$1" in
 		json_init
 		json_add_object status;  json_close_object
 		json_add_object log;     json_close_object
+		json_add_object oplog;   json_close_object
 		json_add_object devices; json_close_object
 		json_add_object online;  json_close_object
 		json_add_object offline; json_close_object
 		json_add_object relogin; json_close_object
 		json_add_object restart; json_close_object
+		json_add_object kick;    json_close_object
+		json_add_object unkick;  json_close_object
 		json_dump
 		;;
 	call)
 		case "$2" in
 			status)  method_status ;;
-			log)     method_log ;;
+			log)     method_log auto ;;
+			oplog)   method_log op ;;
 			devices) method_devices ;;
 			online)  method_action online ;;
 			offline) method_action offline ;;
 			relogin) method_action relogin ;;
 			restart) method_action restart ;;
+			kick)    method_kick ;;
+			unkick)  method_unkick ;;
 			*) json_init; json_add_string message "unknown method"; json_dump ;;
 		esac
 		;;

@@ -25,6 +25,8 @@ echo "==> 清理运行时状态"
 # 暂停标记在 /etc 下，不清掉的话下次装回来会仍然处于「已下线」状态
 rm -rf /var/run/drcom
 rm -f /etc/drcom.paused
+# 设备阻断用的 nft 表
+nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
 
 if [ "$1" = "--purge" ]; then
 	echo "==> 删除配置"

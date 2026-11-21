@@ -3,13 +3,13 @@
 		"description": "Grant access to Dr.COM portal authentication",
 		"read": {
 			"ubus": {
-				"drcom": [ "status", "log", "devices" ]
+				"drcom": [ "status", "log", "oplog", "devices" ]
 			},
 			"uci": [ "drcom" ]
 		},
 		"write": {
 			"ubus": {
-				"drcom": [ "online", "offline", "relogin", "restart" ]
+				"drcom": [ "online", "offline", "relogin", "restart", "kick", "unkick" ]
 			},
 			"uci": [ "drcom" ]
 		}

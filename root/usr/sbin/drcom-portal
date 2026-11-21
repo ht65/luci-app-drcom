@@ -17,8 +17,20 @@ ERR_FILE="$STATE_DIR/last_error"
 PID_FILE="$STATE_DIR/watch.pid"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
-err() { printf '%s ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
+# 日志分类：自动认证（守护循环）与手动操作分开，界面可切换查看
+LOG_TAG="[操作]"
+MIRROR_SYSLOG=1
+
+log() {
+	printf '%s %s %s\n' "$(date '+%F %T')" "$LOG_TAG" "$*"
+	# 守护循环由 procd 收集 stdout 进 syslog；手动操作（界面按钮 / 命令行）没有这层，
+	# 需要自己写一条，否则操作日志在界面上根本看不到。
+	[ "$MIRROR_SYSLOG" = "1" ] && logger -t drcom-portal "$LOG_TAG $*" 2>/dev/null
+}
+err() {
+	printf '%s %s ERROR: %s\n' "$(date '+%F %T')" "$LOG_TAG" "$*" >&2
+	[ "$MIRROR_SYSLOG" = "1" ] && logger -t drcom-portal "$LOG_TAG ERROR: $*" 2>/dev/null
+}
 
 load_config() {
 	config_load drcom
@@ -355,6 +367,10 @@ on_stop() {
 }
 
 watch_loop() {
+	# 守护循环自己写 syslog（procd 收集 stdout），标成「自动」，别再重复 logger
+	LOG_TAG="[自动]"
+	MIRROR_SYSLOG=0
+
 	trap 'on_stop' TERM INT
 	# USR1 只用来「戳醒」循环立即重新检测，不打日志，免得每次接口 ifup 都往 syslog 里写一行
 	trap ':' USR1
