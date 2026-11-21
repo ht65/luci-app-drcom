@@ -23,6 +23,9 @@ start_service() {
 	procd_set_param stderr 1
 	procd_set_param file /etc/config/drcom
 	procd_close_instance
+
+	# 设备阻断是持久的（直到手动解除），重启后要把名单重新下发到内核
+	[ -s /etc/drcom.blocked ] && sh /usr/libexec/rpcd/drcom purge >/dev/null 2>&1
 }
 
 stop_service() {

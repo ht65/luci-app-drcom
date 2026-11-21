@@ -5,8 +5,7 @@
 STATE=/var/run/drcom/state
 STATE_DIR=/var/run/drcom
 META="$STATE_DIR/devmeta"	# mac type last_seen（记住设备是有线还是无线）
-BLOCK="$STATE_DIR/blocked"	# mac 解封时间戳
-BLOCK_SECS=300			# 手动断开后阻断多久（秒）
+BLOCK=/etc/drcom.blocked	# 每行一个 MAC；只要不解除就一直阻断（关闭插件时清空）
 
 # 取 uci 值；缺失时用和 drcom-portal 一致的默认值，
 # 避免界面显示（例如「已禁用」）与运行时实际行为对不上。
@@ -44,25 +43,20 @@ nft_sync_blocks() {
 	fi
 	nft_table_init || return 1
 	nft flush set bridge drcom_block blocked 2>/dev/null
-	while read -r mac exp; do
+	while read -r mac; do
 		[ -n "$mac" ] && nft add element bridge drcom_block blocked "{ $mac }" 2>/dev/null
 	done < "$BLOCK"
 	return 0
 }
 
-# 清掉过期的阻断记录
+# 兼容旧调用：现在没有过期时间，只剩「把文件里的 MAC 同步到内核」
 block_purge() {
-	local now
-	now=$(date +%s)
-	[ -f "$BLOCK" ] || return 0
-	awk -v n="$now" '$2 > n' "$BLOCK" > "$BLOCK.tmp" 2>/dev/null
-	mv "$BLOCK.tmp" "$BLOCK" 2>/dev/null
-	chmod 600 "$BLOCK" 2>/dev/null
+	nft_sync_blocks
 }
 
-# MAC 是否在阻断名单里 -> 输出剩余秒数，未阻断输出空
+# MAC 是否在阻断名单里 -> 输出 1，未阻断输出空
 block_left() {
-	awk -v m="$1" -v n="$(date +%s)" '$1 == m && $2 > n { print $2 - n; exit }' "$BLOCK" 2>/dev/null
+	grep -qx "$1" "$BLOCK" 2>/dev/null && echo 1
 }
 
 # ---------- 状态 ----------
@@ -115,7 +109,10 @@ method_log() {
 		*)  pat='[自动]' ;;
 	esac
 
-	logread -e drcom 2>/dev/null | grep -F "$pat" | tail -n 80 > /tmp/.drcom-log.$$
+	# 老版本启动日志末尾带「（连续失败 N 次后暂停自动重试）」，这句提示已经挪到界面里，显示时去掉
+	logread -e drcom 2>/dev/null | grep -F "$pat" \
+		| sed 's/（连续失败 [0-9][0-9]* 次后暂停自动重试）//' \
+		| tail -n 80 > /tmp/.drcom-log.$$
 	json_init
 	json_add_array lines
 	while IFS= read -r line; do
@@ -223,7 +220,6 @@ method_devices() {
 		json_add_int    online    "$on"
 		json_add_int    wireless  "$wifi"
 		json_add_int    blocked   "$( [ -n "$left" ] && echo 1 || echo 0 )"
-		json_add_int    block_left "${left:-0}"
 		json_add_string last_seen "$seen"
 		json_close_object
 		n=$((n + 1))
@@ -250,7 +246,6 @@ method_devices() {
 		json_add_int    online    "$on"
 		json_add_int    wireless  "$wifi"
 		json_add_int    blocked   "$( [ -n "$left" ] && echo 1 || echo 0 )"
-		json_add_int    block_left "${left:-0}"
 		json_add_string last_seen "$seen"
 		json_close_object
 		n=$((n + 1))
@@ -312,7 +307,7 @@ method_kick() {
 	# 1) 先落阻断规则（只丢单播，广播放行，设备还能 DHCP / 保持关联）
 	: > "$BLOCK.tmp"
 	[ -f "$BLOCK" ] && awk -v m="$mac" '$1 != m' "$BLOCK" >> "$BLOCK.tmp"
-	printf '%s %s\n' "$mac" "$(( $(date +%s) + BLOCK_SECS ))" >> "$BLOCK.tmp"
+	printf '%s\n' "$mac" >> "$BLOCK.tmp"
 	mv "$BLOCK.tmp" "$BLOCK"
 	chmod 600 "$BLOCK" 2>/dev/null
 	nft_sync_blocks
@@ -321,10 +316,10 @@ method_kick() {
 	#    所以点「解除」时流量马上恢复）
 	flush_conntrack "$ip"
 
-	logger -t drcom-portal "[操作] 已断开设备 $mac，阻断 $((BLOCK_SECS / 60)) 分钟（解除立即恢复）" 2>/dev/null
+	logger -t drcom-portal "[操作] 已阻断设备 $mac（直到手动解除）" 2>/dev/null
 
 	json_init
-	json_add_string message "已断开该设备，阻断其流量 $((BLOCK_SECS / 60)) 分钟（解除后立即恢复）"
+	json_add_string message "已断开该设备，阻断持续到你点「解除」（或关闭插件）"
 	json_dump
 }
 
@@ -376,7 +371,7 @@ method_master() {
 		uci -q commit drcom
 		/etc/init.d/drcom stop >/dev/null 2>&1
 		# 停用就不要再拦着任何设备了
-		: > "$BLOCK"
+		rm -f "$BLOCK"
 		nft_sync_blocks
 		logger -t drcom-portal "[操作] 插件已停用" 2>/dev/null
 		json_init

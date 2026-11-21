@@ -388,13 +388,10 @@ watch_loop() {
 	mkdir -p "$STATE_DIR" 2>/dev/null
 	printf '%s\n' "$$" > "$PID_FILE"
 
-	log "服务启动（连续失败 $FAIL_MAX 次后暂停自动重试）"
+	log "服务启动"
 	[ -f "$PAUSE_FILE" ] && log "检测到手动下线标记，保持暂停状态"
 
 	while true; do
-		# 清理到期的设备阻断（界面「断开」写入的 5 分钟阻断；即使没人看页面也要能自动解除）
-		[ -f "$STATE_DIR/blocked" ] && sh /usr/libexec/rpcd/drcom purge >/dev/null 2>&1
-
 		# 每轮重新读配置，界面上改完设置无需重启服务即可生效
 		load_config
 
