@@ -272,25 +272,34 @@ return view.extend({
 		}
 
 		function applyDevices(d) {
-			var list = (d && d.devices) || [];
+			var all = (d && d.devices) || [];
+
+			// 只显示「在线」和「已阻断」的设备。
+			// 断开的设备（无线掉了 / ARP 不通）直接不显示，而不是留一行灰的。
+			// 已阻断的必须留着，否则就没有「解除」按钮了。
+			var list = all.filter(function(x) {
+				return parseInt(x.online) == 1 || parseInt(x.blocked) == 1;
+			});
 
 			while (devList.firstChild)
 				devList.removeChild(devList.firstChild);
 
 			if (!list.length) {
-				devCount.textContent = '0 台';
+				devCount.textContent = '0 台在线';
 				devList.appendChild(E('p', { 'class': 'drcom-note' }, '当前没有已连接的设备。'));
 				return;
 			}
 
-			var online = 0;
+			var online = 0, blocked = 0;
 			list.forEach(function(x) {
 				if (parseInt(x.online) == 1)
 					online++;
+				else if (parseInt(x.blocked) == 1)
+					blocked++;
 			});
-			devCount.textContent = online + ' / ' + list.length + ' 台在线';
+			devCount.textContent = online + ' 台在线' + (blocked ? ' · ' + blocked + ' 台已阻断' : '');
 
-			// 在线的排前面，其次阻断的，最后离线的
+			// 在线的排前面，阻断的排后面
 			list.sort(function(a, b) {
 				var sa = (parseInt(a.online) || 0) * 2 + (parseInt(a.blocked) || 0);
 				var sb = (parseInt(b.online) || 0) * 2 + (parseInt(b.blocked) || 0);
@@ -442,8 +451,8 @@ return view.extend({
 		], [
 			devList,
 			E('p', { 'class': 'drcom-note' },
-				'「断开」立即切断该设备连接并持续阻断，直到你点「解除」或关闭插件总开关；'
-				+ '请勿对自己正在使用的设备操作。离线状态以无线连接、ARP 邻居为准。')
+				'只显示当前在线和已阻断的设备，断开的设备会自动从列表消失。'
+				+ '「断开」会立即切断并持续阻断，直到你点「解除」或关闭插件总开关；请勿对自己正在使用的设备操作。')
 		]);
 
 		// ---- 卡片 4：认证设置（表单嵌进卡片里） ----

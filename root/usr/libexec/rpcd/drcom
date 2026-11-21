@@ -304,6 +304,26 @@ method_devices() {
 		n=$((n + 1))
 	done < "$nb"
 
+	# 阻断名单里如果还有不在上面的 MAC（租约过期、ARP 也消失了），补一条出来，
+	# 否则界面上就找不到「解除」按钮了
+	if [ -s "$BLOCK" ]; then
+		while read -r mac; do
+			[ -n "$mac" ] || continue
+			grep -q "^$mac " "$ne" 2>/dev/null && continue
+			printf '%s %s %s\n' "$mac" e 0 >> "$ne" 2>/dev/null
+			json_add_object
+			json_add_string name      ""
+			json_add_string ip        ""
+			json_add_string mac       "$mac"
+			json_add_int    online    0
+			json_add_int    wireless  0
+			json_add_int    blocked   1
+			json_add_string last_seen "0"
+			json_close_object
+			n=$((n + 1))
+		done < "$BLOCK"
+	fi
+
 	json_close_array
 	json_add_int count "$n"
 	json_dump
