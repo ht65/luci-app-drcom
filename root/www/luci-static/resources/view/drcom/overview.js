@@ -51,7 +51,7 @@ var CSS = [
 	'.drcom-tag-block{background:rgba(198,40,40,.14);color:#c62828}',
 	'.drcom-btn-sm{font-size:12px !important;padding:0 10px !important;min-height:24px !important;line-height:22px !important}',
 	// 日志
-	'.drcom-log{max-height:280px;overflow:auto;padding:9px 10px;margin:0;background:rgba(127,127,127,.1);border-radius:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-all}',
+	'.drcom-log{min-height:170px;max-height:280px;overflow:auto;padding:9px 10px;margin:0;background:rgba(127,127,127,.1);border-radius:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-all}',
 	'.drcom-tabs{display:flex;gap:6px;margin:0 0 8px}',
 	'.drcom-tab{font-size:12px;padding:2px 10px;border-radius:10px;border:1px solid rgba(128,128,128,.35);background:transparent;cursor:pointer;color:inherit;line-height:1.7}',
 	'.drcom-tab-on{background:rgba(90,110,190,.14);border-color:rgba(90,110,190,.45)}',
@@ -118,6 +118,8 @@ return view.extend({
 		var logKind = 'auto';  // 'auto' 自动认证日志 / 'op' 手动操作日志
 
 		var failMax = parseInt(uci.get('drcom', 'main', 'fail_max')) || 5;
+		// 「连续失败 N 次后暂停重试」这句提示随配置实时更新，不用刷新页面
+		var failHint = E('p', { 'class': 'drcom-note' }, '');
 
 		var badge = E('span', {
 			'style': 'display:inline-block;padding:1px 10px;border-radius:10px;color:#fff;font-size:12px;line-height:1.8;background:#666'
@@ -215,6 +217,12 @@ return view.extend({
 			else {
 				warnEl.style.display = 'none';
 			}
+
+			var fm = parseInt(s.fail_max);
+			if (!isNaN(fm) && fm > 0)
+				failMax = fm;
+			failHint.textContent = '修改后保存，最多 60 秒自动生效；需要立刻生效请点上方「重启服务」。'
+				+ '连续失败 ' + failMax + ' 次后会自动暂停重试，避免账号被风控。';
 
 			masterOn = enabled;
 			setMasterUi();
@@ -355,7 +363,12 @@ return view.extend({
 			}).then(function() {
 				if (!wantSlow)
 					return null;
-				return callDevices().then(applyDevices).catch(function() {}).then(fetchLog);
+				return callDevices().then(applyDevices).catch(function() {
+					while (devList.firstChild)
+						devList.removeChild(devList.firstChild);
+					devCount.textContent = '读取失败';
+					devList.appendChild(E('p', { 'class': 'drcom-note' }, '（读取设备列表失败，可点「刷新」重试）'));
+				}).then(fetchLog);
 			});
 		}
 
@@ -456,11 +469,12 @@ return view.extend({
 			if (kind == logKind)
 				return;
 			logKind = kind;
-			lastLog = null;
+			lastLog = null;		// 两种日志内容不同，强制重绘
 			renderTabs();
-			logPre.textContent = '（切换中…）';
-			// 切日志只重拉日志，不必动状态与设备
-			fetchLog();
+			// 不把内容替换成「切换中…」：那会让日志框瞬间变矮再回弹，很突兀。
+			// 保留旧内容、只降透明度，等新日志到了再恢复。
+			logPre.style.opacity = '.45';
+			fetchLog().finally(function() { logPre.style.opacity = ''; });
 		}
 
 		tabAuto.addEventListener('click', function(ev) { ev.preventDefault(); switchLog('auto'); });
@@ -520,9 +534,11 @@ return view.extend({
 		o.default = '5';
 
 		o = s.option(form.Value, 'portal_host', _('认证门户域名'), _('用于打开认证页获取服务器地址。换学校时需要修改。'));
+		o.datatype = 'hostname';
 		o.placeholder = 'login.cqcfe.com';
 
 		o = s.option(form.Value, 'portal_ip', _('认证服务器 IP'), _('取不到门户地址时的兜底。'));
+		o.datatype = 'ipaddr';
 		o.placeholder = '172.22.44.46';
 
 		o = s.option(form.Value, 'portal_port', _('认证端口'));
@@ -534,10 +550,7 @@ return view.extend({
 		refresh(true);
 
 		return Promise.resolve(m.render()).then(function(node) {
-			// 表单说明：生效时机 + 连续失败提醒（原来写在守护进程日志里，现在放这里）
-			formBody.appendChild(E('p', { 'class': 'drcom-note' },
-				'修改后保存，最多 60 秒自动生效；需要立刻生效请点上方「重启服务」。'
-				+ '连续失败 ' + failMax + ' 次后会自动暂停重试，避免账号被风控。'));
+			formBody.appendChild(failHint);
 			formBody.appendChild(E('div', { 'class': 'drcom-form' }, node));
 
 			return E([
