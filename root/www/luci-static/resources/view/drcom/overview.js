@@ -8,6 +8,7 @@
 
 var callStatus  = rpc.declare({ object: 'drcom', method: 'status',  expect: { '': {} } });
 var callLog     = rpc.declare({ object: 'drcom', method: 'log',     expect: { '': {} } });
+var callDevices = rpc.declare({ object: 'drcom', method: 'devices', expect: { '': {} } });
 var callOnline  = rpc.declare({ object: 'drcom', method: 'online',  expect: { '': {} } });
 var callOffline = rpc.declare({ object: 'drcom', method: 'offline', expect: { '': {} } });
 var callRelogin = rpc.declare({ object: 'drcom', method: 'relogin', expect: { '': {} } });
@@ -21,8 +22,8 @@ var TERM_NAMES = {
 	'4': '平板 · 竖屏'
 };
 
-// 日志比状态刷新得慢：状态 5 秒一轮，日志每 3 轮（15 秒）才拉一次，减少无谓流量
-var LOG_EVERY = 3;
+// 状态 5 秒一轮；日志与设备列表每 3 轮（15 秒）拉一次，减少无谓开销
+var SLOW_EVERY = 3;
 
 // 布局全部交给 CSS 类，便于随容器宽度自适应；LuCI 主题自带的 .cbi-section 没有水平内边距
 var CSS = [
@@ -35,6 +36,17 @@ var CSS = [
 	'.drcom-note{margin:10px 0 0;font-size:12px;opacity:.7;line-height:1.6}',
 	'.drcom-warn{margin:10px 0 0;font-size:12px;line-height:1.6;color:#ef6c00}',
 	'.drcom-log{max-height:300px;overflow:auto;padding:10px;margin:0;background:rgba(127,127,127,.1);border-radius:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-all}',
+	// 设备列表：flex-wrap，窄屏自动折行
+	'.drcom-dev{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;padding:7px 0;border-bottom:1px solid rgba(128,128,128,.18);font-size:13px}',
+	'.drcom-dev:last-child{border-bottom:none}',
+	'.drcom-dev-name{flex:1 1 130px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+	'.drcom-dev-ip{flex:0 0 auto;opacity:.8;font-variant-numeric:tabular-nums}',
+	'.drcom-dev-mac{flex:0 0 auto;opacity:.5;font-size:11px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}',
+	'.drcom-dev-tag{flex:0 0 auto;font-size:11px;padding:1px 7px;border-radius:9px;background:rgba(128,128,128,.14);white-space:nowrap}',
+	'.drcom-dev-off{opacity:.45}',
+	'.drcom-dev-count{font-size:12px;opacity:.65}',
+	// 表单卡片补底部留白，否则最后一个输入框的底边框正好压在卡片底边上
+	'.drcom-form .cbi-section{padding-bottom:12px}',
 	'@media (max-width:560px){.drcom-kv-l{flex:0 0 100%;max-width:none}}'
 ].join('\n');
 
@@ -62,7 +74,7 @@ return view.extend({
 	},
 
 	render: function() {
-		var tick = 0;          // 轮询计数，用来降低日志刷新频率
+		var tick = 0;          // 轮询计数，用来降低日志/设备列表刷新频率
 		var lastLog = null;    // 上一次日志内容，没变就不重绘（否则会把滚动位置拽回去）
 
 		var badge = E('span', {
@@ -148,9 +160,47 @@ return view.extend({
 			logPre.scrollTop = atBottom ? logPre.scrollHeight : prevTop;
 		}
 
-		// 严格串行：先状态，必要时再日志。并发 RPC 在 LuCI 26 上会卡住页面。
+		function applyDevices(d) {
+			var list = (d && d.devices) || [];
+
+			while (devList.firstChild)
+				devList.removeChild(devList.firstChild);
+
+			if (!list.length) {
+				devCount.textContent = '0 台';
+				devList.appendChild(E('p', { 'class': 'drcom-note' }, '当前没有已连接的设备。'));
+				return;
+			}
+
+			var online = 0;
+			list.forEach(function(x) {
+				if (parseInt(x.online) == 1)
+					online++;
+			});
+			devCount.textContent = online + ' / ' + list.length + ' 台在线';
+
+			// 在线的排前面
+			list.sort(function(a, b) {
+				return (parseInt(b.online) || 0) - (parseInt(a.online) || 0);
+			});
+
+			list.forEach(function(x) {
+				var on = parseInt(x.online) == 1;
+				var wifi = parseInt(x.wireless) == 1;
+
+				devList.appendChild(E('div', { 'class': 'drcom-dev' + (on ? '' : ' drcom-dev-off') }, [
+					E('span', { 'class': 'drcom-dev-name' }, x.name || '未知设备'),
+					E('span', { 'class': 'drcom-dev-ip' }, x.ip || '—'),
+					E('span', { 'class': 'drcom-dev-mac' }, x.mac || ''),
+					E('span', { 'class': 'drcom-dev-tag' },
+						(wifi ? 'WiFi' : '有线') + (on ? '' : ' · 离线'))
+				]));
+			});
+		}
+
+		// 严格串行：先状态，必要时再日志、设备。并发 RPC 在 LuCI 26 上会卡住页面。
 		function refresh() {
-			var wantLog = (tick % LOG_EVERY) === 0;
+			var wantSlow = (tick % SLOW_EVERY) === 0;
 			tick++;
 
 			return callStatus().then(function(st) {
@@ -159,9 +209,12 @@ return view.extend({
 				badge.textContent = '状态获取失败';
 				badge.style.background = '#c62828';
 			}).then(function() {
-				if (!wantLog)
+				if (!wantSlow)
 					return null;
-				return callLog().then(applyLog).catch(function() {});
+				return callLog().then(applyLog).catch(function() {}).then(function() {
+					// 设备列表最慢，放到最后，失败不影响其它信息
+					return callDevices().then(applyDevices).catch(function() {});
+				});
 			});
 		}
 
@@ -208,6 +261,17 @@ return view.extend({
 			E('p', { 'class': 'drcom-note' },
 				'「立即重新认证」只重新走一次认证，不动接口；「下线路由器」会断开本机上行并暂停自动认证'
 				+ '（重启路由器后仍保持暂停），只作用于这台路由器，不会波及同账号的手机等其他设备。')
+		]);
+
+		var devCount = E('span', { 'class': 'drcom-dev-count' }, '…');
+		var devList = E('div', {}, E('p', { 'class': 'drcom-note' }, '（加载中…）'));
+
+		var devicesBox = section([
+			E('span', {}, '当前连接设备'), ' ', devCount
+		], [
+			devList,
+			E('p', { 'class': 'drcom-note' },
+				'列表合并了 DHCP 租约、LAN 邻居表和无线连接列表；「离线」表示还剩租约但当前不在线。')
 		]);
 
 		var logPre = E('pre', { 'class': 'drcom-log' }, '（加载中…）');
@@ -286,7 +350,15 @@ return view.extend({
 		refresh();
 
 		return Promise.resolve(m.render()).then(function(node) {
-			return E([ E('style', {}, CSS), statusBox, actions, node, logBox ]);
+			return E([
+				E('style', {}, CSS),
+				statusBox,
+				actions,
+				devicesBox,
+				// 包一层，好给表单卡片补底部留白（见 CSS 里的 .drcom-form）
+				E('div', { 'class': 'drcom-form' }, node),
+				logBox
+			]);
 		});
 	}
 });

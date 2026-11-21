@@ -27,9 +27,14 @@ method_status() {
 	[ "$stamp" -gt 0 ] 2>/dev/null && age=$(( $(date +%s) - stamp ))
 
 	port=$(cfg portal_port 801)
-	ser=$(cat "$STATE_DIR/server" 2>/dev/null)
 	term=$(cfg terminal_type 1)
 	enabled=$(cfg enabled 1)
+
+	# 认证服务器：优先用实际探测到的地址；没有缓存时回退到配置里的兜底 IP，
+	# 否则界面会只剩一个「—」，看起来像配置丢了。
+	ser=$(cat "$STATE_DIR/server" 2>/dev/null)
+	[ -n "$ser" ] || ser=$(cfg portal_ip 172.22.44.46)
+
 	[ -n "$(uci -q get drcom.main.username)" ] && [ -n "$(uci -q get drcom.main.password)" ] && configured=1
 
 	json_init
@@ -63,6 +68,90 @@ method_log() {
 	json_dump
 }
 
+# 当前连接设备：合并 DHCP 租约、LAN 邻居表和无线 station 列表
+method_devices() {
+	local wl="$STATE_DIR/.wlmacs" nb="$STATE_DIR/.neigh" seen="$STATE_DIR/.seen"
+	local landev mac ip host exp cid on wifi nip n=0 d
+
+	landev=$(uci -q get network.lan.device)
+	[ -n "$landev" ] || landev=br-lan
+
+	mkdir -p "$STATE_DIR" 2>/dev/null
+
+	# 无线客户端 MAC：取所有 AP 模式接口的 station 列表
+	: > "$wl"
+	for d in $(ls /sys/class/net 2>/dev/null); do
+		[ -e "/sys/class/net/$d/phy80211" ] || continue
+		iw dev "$d" info 2>/dev/null | grep -q 'type AP' || continue
+		iw dev "$d" station dump 2>/dev/null \
+			| sed -n 's/^Station \([0-9A-Fa-f:]*\).*/\1/p' \
+			| tr 'A-F' 'a-f' >> "$wl"
+	done
+
+	# LAN 侧邻居表（有 lladdr 且不是 FAILED 视为在线），输出 "mac ip"。
+	# 注意：`ip neigh show dev X` 的输出里不带 "dev X" 列，直接 `ip neigh show` 才有，
+	# 所以两种格式都要能解析。
+	ip neigh show dev "$landev" 2>/dev/null \
+		| grep -v FAILED \
+		| sed -n \
+			-e 's/^\([0-9.]*\) dev [^ ]* lladdr \([0-9A-Fa-f:]*\).*/\2 \1/p' \
+			-e 's/^\([0-9.]*\) lladdr \([0-9A-Fa-f:]*\).*/\2 \1/p' \
+		| tr 'A-F' 'a-f' > "$nb"
+
+	json_init
+	json_add_array devices
+	: > "$seen"
+
+	# 先列 DHCP 租约（带主机名）
+	while read -r exp mac ip host cid; do
+		[ -n "$mac" ] || continue
+		mac=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
+		[ "$host" = "*" ] && host=""
+
+		nip=$(awk -v m="$mac" '$1 == m { print $2; exit }' "$nb")
+		[ -n "$nip" ] && ip="$nip"
+		on=0
+		[ -n "$nip" ] && on=1
+		wifi=0
+		grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
+
+		printf '%s\n' "$mac" >> "$seen"
+		json_add_object
+		json_add_string name     "$host"
+		json_add_string ip       "$ip"
+		json_add_string mac      "$mac"
+		json_add_int    online   "$on"
+		json_add_int    wireless "$wifi"
+		json_close_object
+		n=$((n + 1))
+	done < /tmp/dhcp.leases
+
+	# 再补上邻居表里有、但没有 DHCP 租约的设备（静态 IP）
+	if [ -s "$nb" ]; then
+		while read -r mac ip; do
+			[ -n "$mac" ] || continue
+			grep -qx "$mac" "$seen" 2>/dev/null && continue
+			wifi=0
+			grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
+			printf '%s\n' "$mac" >> "$seen"
+			json_add_object
+			json_add_string name     ""
+			json_add_string ip       "$ip"
+			json_add_string mac      "$mac"
+			json_add_int    online   1
+			json_add_int    wireless "$wifi"
+			json_close_object
+			n=$((n + 1))
+		done < "$nb"
+	fi
+
+	json_close_array
+	json_add_int count "$n"
+	json_dump
+
+	rm -f "$wl" "$nb" "$seen" 2>/dev/null
+}
+
 method_action() {
 	local out
 	case "$1" in
@@ -81,6 +170,7 @@ case "$1" in
 		json_init
 		json_add_object status;  json_close_object
 		json_add_object log;     json_close_object
+		json_add_object devices; json_close_object
 		json_add_object online;  json_close_object
 		json_add_object offline; json_close_object
 		json_add_object relogin; json_close_object
@@ -91,6 +181,7 @@ case "$1" in
 		case "$2" in
 			status)  method_status ;;
 			log)     method_log ;;
+			devices) method_devices ;;
 			online)  method_action online ;;
 			offline) method_action offline ;;
 			relogin) method_action relogin ;;
