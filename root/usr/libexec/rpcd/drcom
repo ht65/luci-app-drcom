@@ -372,4 +372,9 @@ case "$1" in
 			*) json_init; json_add_string message "unknown method"; json_dump ;;
 		esac
 		;;
+	purge)
+		# 供 drcom-portal 守护循环调用：清理到期的设备阻断并同步内核规则
+		block_purge
+		nft_sync_blocks
+		;;
 esac
