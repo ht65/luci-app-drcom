@@ -198,7 +198,8 @@ return view.extend({
 			});
 		}
 
-		// 严格串行：先状态，必要时再日志、设备。并发 RPC 在 LuCI 26 上会卡住页面。
+		// 严格串行：先状态，再设备、最后日志。并发 RPC 在 LuCI 26 上会卡住页面。
+		// 设备列表放在日志前面：日志要读 80 行，慢的时候会让设备区一直停在「加载中」。
 		function refresh() {
 			var wantSlow = (tick % SLOW_EVERY) === 0;
 			tick++;
@@ -211,9 +212,8 @@ return view.extend({
 			}).then(function() {
 				if (!wantSlow)
 					return null;
-				return callLog().then(applyLog).catch(function() {}).then(function() {
-					// 设备列表最慢，放到最后，失败不影响其它信息
-					return callDevices().then(applyDevices).catch(function() {});
+				return callDevices().then(applyDevices).catch(function() {}).then(function() {
+					return callLog().then(applyLog).catch(function() {});
 				});
 			});
 		}
