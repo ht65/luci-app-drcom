@@ -28,8 +28,10 @@ nft_table_init() {
 	nft add set bridge drcom_block blocked '{ type ether_addr; }' 2>/dev/null || return 1
 	nft add chain bridge drcom_block input '{ type filter hook input priority -10; policy accept; }' 2>/dev/null
 	nft add chain bridge drcom_block forward '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null
-	nft 'add rule bridge drcom_block input ether saddr @blocked drop' 2>/dev/null
-	nft 'add rule bridge drcom_block forward ether saddr @blocked drop' 2>/dev/null
+	# 只丢弃「单播」帧：广播（DHCP/ARP）照常放行，这样被断的设备还能重新关联并拿到 IP，
+	# 保持"已连接但没网"的状态；这样点「解除」时可以立即恢复，不用等它重新连。
+	nft 'add rule bridge drcom_block input ether saddr @blocked ether daddr != ff:ff:ff:ff:ff:ff drop' 2>/dev/null
+	nft 'add rule bridge drcom_block forward ether saddr @blocked ether daddr != ff:ff:ff:ff:ff:ff drop' 2>/dev/null
 	return 0
 }
 
@@ -273,35 +275,53 @@ method_devices() {
 
 # ---------- 断开设备 ----------
 
-# 读 rpcd 通过 stdin 传来的 JSON 参数
-read_mac() {
-	local req mac
+# 读 rpcd 通过 stdin 传来的 JSON 参数（mac / 可选 ip）
+read_params() {
+	local req
 	IFS= read -r req 2>/dev/null
-	mac=$(printf '%s' "$req" | jsonfilter -e '@.mac' 2>/dev/null)
-	mac=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
-	case "$mac" in
-		''|*[!0-9a-f:]*) printf '' ; return 1 ;;
+	P_MAC=$(printf '%s' "$req" | jsonfilter -e '@.mac' 2>/dev/null | tr 'A-F' 'a-f')
+	P_IP=$(printf '%s' "$req" | jsonfilter -e '@.ip' 2>/dev/null)
+	case "$P_MAC" in
+		''|*[!0-9a-f:]*) return 1 ;;
 	esac
-	printf '%s' "$mac"
+	return 0
+}
+
+# 清掉该设备已建立的连接。
+# 本机开着 flow_offloading_hw，旧连接在硬件里转发、不经过 netfilter，
+# 只加防火墙规则要等旧连接超时才断；删掉 conntrack（硬件表随之失效）才能立刻断。
+flush_conntrack() {
+	[ -n "$1" ] || return 0
+	if ! command -v conntrack >/dev/null 2>&1; then
+		# 没有 conntrack 工具时只能靠防火墙规则拦新连接，旧连接要等自己超时
+		logger -t drcom-portal "[操作] 未安装 conntrack，已建立的连接不会立刻断开（新连接仍被阻断）" 2>/dev/null
+		return 0
+	fi
+	conntrack -D -s "$1" >/dev/null 2>&1
+	conntrack -D -d "$1" >/dev/null 2>&1
 }
 
 method_kick() {
-	local mac
-	mac=$(read_mac) || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
+	local mac ip
+	read_params || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
+	mac="$P_MAC"
+	ip="$P_IP"
 
 	mkdir -p "$STATE_DIR" 2>/dev/null
 
-	# 只做 L2 阻断，不发 deauth。
-	# 发 deauth 虽然看起来"断得更彻底"，但设备重新关联后流量仍被丢，DHCP/连通性检查失败，
-	# 客户端会进入退避，解除后要等它自己重试才恢复（实测 >25 秒）。
-	# 只丢包则设备保持关联，解除瞬间流量就通。
+	# 1) 先落阻断规则（只丢单播，广播放行，设备还能 DHCP / 保持关联）
 	: > "$BLOCK.tmp"
 	[ -f "$BLOCK" ] && awk -v m="$mac" '$1 != m' "$BLOCK" >> "$BLOCK.tmp"
 	printf '%s %s\n' "$mac" "$(( $(date +%s) + BLOCK_SECS ))" >> "$BLOCK.tmp"
 	mv "$BLOCK.tmp" "$BLOCK"
 	chmod 600 "$BLOCK" 2>/dev/null
 	nft_sync_blocks
-	logger -t drcom-portal "[操作] 已阻断设备 $mac 的网络访问，$((BLOCK_SECS / 60)) 分钟后自动解除" 2>/dev/null
+
+	# 2) 清掉它的已有连接，旧连接立刻失效（不需要 deauth，设备保持关联，
+	#    所以点「解除」时流量马上恢复）
+	flush_conntrack "$ip"
+
+	logger -t drcom-portal "[操作] 已断开设备 $mac，阻断 $((BLOCK_SECS / 60)) 分钟（解除立即恢复）" 2>/dev/null
 
 	json_init
 	json_add_string message "已断开该设备，阻断其流量 $((BLOCK_SECS / 60)) 分钟（解除后立即恢复）"
@@ -310,7 +330,8 @@ method_kick() {
 
 method_unkick() {
 	local mac
-	mac=$(read_mac) || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
+	read_params || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
+	mac="$P_MAC"
 
 	: > "$BLOCK.tmp"
 	[ -f "$BLOCK" ] && awk -v m="$mac" '$1 != m' "$BLOCK" >> "$BLOCK.tmp"

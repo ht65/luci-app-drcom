@@ -13,7 +13,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-drcom
-PKG_VERSION:=1.0.5
+PKG_VERSION:=1.0.6
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=ht65
@@ -30,7 +30,7 @@ define Package/luci-app-drcom
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Dr.COM 校园网 Portal 认证
-  DEPENDS:=+rpcd
+  DEPENDS:=+rpcd +conntrack
   PKGARCH:=all
 endef
 

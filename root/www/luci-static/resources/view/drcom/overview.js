@@ -14,7 +14,7 @@ var callOnline  = rpc.declare({ object: 'drcom', method: 'online',  expect: { ''
 var callOffline = rpc.declare({ object: 'drcom', method: 'offline', expect: { '': {} } });
 var callRelogin = rpc.declare({ object: 'drcom', method: 'relogin', expect: { '': {} } });
 var callRestart = rpc.declare({ object: 'drcom', method: 'restart', expect: { '': {} } });
-var callKick    = rpc.declare({ object: 'drcom', method: 'kick',    params: [ 'mac' ], expect: { '': {} } });
+var callKick    = rpc.declare({ object: 'drcom', method: 'kick',    params: [ 'mac', 'ip' ], expect: { '': {} } });
 var callUnkick  = rpc.declare({ object: 'drcom', method: 'unkick',  params: [ 'mac' ], expect: { '': {} } });
 var callStart   = rpc.declare({ object: 'drcom', method: 'start',   expect: { '': {} } });
 var callStop    = rpc.declare({ object: 'drcom', method: 'stop',    expect: { '': {} } });
@@ -225,13 +225,13 @@ return view.extend({
 		function kickDevice(x) {
 			var label = x.name || x.ip || x.mac;
 			var ok = window.confirm('断开「' + label + '」？\n\n'
-				+ '会阻断它的网络访问 5 分钟（到期自动解除，也可以点「解除」立即恢复）。\n'
+				+ '会立即切断它已建立的连接，并阻断新连接 5 分钟（到期自动解除，也可以点「解除」立即恢复上网）。\n'
 				+ '设备可能仍显示已连接 WiFi，但无法上网。\n'
 				+ '如果这是你正在用的这台设备，阻断期间将无法访问本页面。');
 			if (!ok)
 				return;
 
-			callKick(x.mac).then(function(r) {
+			callKick(x.mac, x.ip || '').then(function(r) {
 				ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已断开'));
 				return refresh(true);
 			}).catch(function(e) {
@@ -415,8 +415,8 @@ return view.extend({
 		], [
 			devList,
 			E('p', { 'class': 'drcom-note' },
-				'「断开」会阻断该设备的网络访问 5 分钟（到期自动解除，点「解除」立即恢复），期间设备可能仍显示已连接 WiFi。'
-				+ '请勿对自己正在使用的设备操作。离线状态以无线连接、ARP 邻居为准。')
+				'「断开」会立即切断该设备的连接并阻断新连接 5 分钟（到期自动解除），点「解除」立即恢复；'
+				+ '期间设备可能仍显示已连接 WiFi。请勿对自己正在使用的设备操作。离线状态以无线连接、ARP 邻居为准。')
 		]);
 
 		var logPre = E('pre', { 'class': 'drcom-log' }, '（加载中…）');
