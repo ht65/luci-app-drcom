@@ -70,7 +70,14 @@ load_config() {
 	config_get      FAIL_MAX        main fail_max           "5"
 	config_get      PROBE_URL       main probe_url "http://www.msftconnecttest.com/connecttest.txt"
 	config_get      PROBE_EXPECT    main probe_expect "Microsoft Connect Test"
-	ACCOUNT="$USERNAME$CARRIER"
+	# 账号已自带运营商后缀时不要重复拼（例如账号写成 xx@dx 又选了电信）
+	ACCOUNT="$USERNAME"
+	if [ -n "$CARRIER" ]; then
+		case "$USERNAME" in
+			*"$CARRIER") : ;;
+			*) ACCOUNT="$USERNAME$CARRIER" ;;
+		esac
+	fi
 	# 0-未知 1-PC 2-手机 3-平板(横屏) 4-平板(竖屏)，决定上报的终端类型
 	case "$TERMINAL_TYPE" in
 		0|1|2|3|4) ;;
@@ -175,13 +182,21 @@ iface_ip() {
 		jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null
 }
 
-# auto: 优先无线中继(wwan)，其次有线(wan)，取第一个拿到 IP 的
+iface_up() {
+	[ "$(ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]
+}
+
+# auto: 优先无线中继(wwan)，其次有线(wan)，取第一个拿到 IP 的；
+# 都没有 IP 时退回第一个「接口已 up」的，避免 ifdown/ifup 打到无关/不存在的接口。
 resolve_uplink() {
 	case "$UPLINK" in
 		""|auto)
 			local ifc
 			for ifc in wwan wan; do
 				[ -n "$(iface_ip $ifc)" ] && { echo "$ifc"; return 0; }
+			done
+			for ifc in wwan wan; do
+				iface_up "$ifc" && { echo "$ifc"; return 0; }
 			done
 			echo wwan
 			;;
@@ -213,10 +228,17 @@ portal_server() {
 	fi
 }
 
-# 未认证时该地址会被劫持到认证页，只有真正通了才会返回预期内容
+# 只读缓存/配置里的认证服务器，不发任何网络请求（供 status 等诊断命令用）
+server_cached() {
+	local cached="$STATE_DIR/server"
+	if [ -s "$cached" ]; then cat "$cached"; else printf '%s' "$PORTAL_IP"; fi
+}
+
+# 未认证时该地址会被劫持到认证页，只有真正通了才会返回预期内容。
+# 可选参数：超时秒数（默认 8；诊断命令用更短的超时，避免长时间卡住）。
 probe_online() {
-	local body
-	body=$(wget -q -O - -T 8 "$PROBE_URL" 2>/dev/null | tr -d '\r\n')
+	local to="${1:-8}" body
+	body=$(wget -q -O - -T "$to" "$PROBE_URL" 2>/dev/null | tr -d '\r\n')
 	[ "$body" = "$PROBE_EXPECT" ]
 }
 
@@ -231,7 +253,6 @@ do_login() {
 	ser=$(portal_server)
 	mkdir -p "$STATE_DIR" 2>/dev/null
 	resp="$STATE_DIR/login.json"
-	urls="$STATE_DIR/login.url"
 
 	# 带上 wlan_user_ip：部分 ePortal 4.x 部署会校验它，缺了会报「IP 不一致」
 	url="http://$ser:$PORTAL_PORT/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,$(urlencode "$ACCOUNT")&user_password=$(urlencode "$PASSWORD")&wlan_user_ip=$ip&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.1.3&terminal_type=$TERMINAL_TYPE&lang=zh-cn&v=$(date +%s)"
@@ -362,11 +383,11 @@ do_status() {
 	echo "上行地址: ${ip:-未获取}"
 	echo "账号:     ${ACCOUNT:-未配置}"
 	echo "终端类型: $TERMINAL_TYPE"
-	echo "认证服务器: $(portal_server):$PORTAL_PORT"
+	echo "认证服务器: $(server_cached):$PORTAL_PORT"
 	[ -f "$PAUSE_FILE" ] && echo "自动认证: 已暂停（手动下线）"
 	[ -f "$HOLD_FILE" ] && echo "自动认证: 已暂停（连续失败 $fails 次）"
 	[ -n "$errmsg" ] && echo "最近错误: $errmsg"
-	if probe_online; then echo "网络状态: 已认证，可上网"; else echo "网络状态: 未认证/无网络"; fi
+	if probe_online 3; then echo "网络状态: 已认证，可上网"; else echo "网络状态: 未认证/无网络"; fi
 }
 
 # 唤醒守护进程立即重新检测（热插拔、手动上下线后调用），比整体重启服务轻得多

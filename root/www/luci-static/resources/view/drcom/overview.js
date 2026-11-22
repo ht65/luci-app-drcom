@@ -9,7 +9,7 @@
 var callStatus  = rpc.declare({ object: 'drcom', method: 'status',  expect: { '': {} } });
 var callLogAuto = rpc.declare({ object: 'drcom', method: 'log',     expect: { '': {} } });
 var callLogOp   = rpc.declare({ object: 'drcom', method: 'oplog',   expect: { '': {} } });
-var callDevices = rpc.declare({ object: 'drcom', method: 'devices', expect: { '': {} } });
+var callDevices = rpc.declare({ object: 'drcom', method: 'devices', params: [ 'force' ], expect: { '': {} } });
 var callOnline  = rpc.declare({ object: 'drcom', method: 'online',  expect: { '': {} } });
 var callOffline = rpc.declare({ object: 'drcom', method: 'offline', expect: { '': {} } });
 var callRelogin = rpc.declare({ object: 'drcom', method: 'relogin', expect: { '': {} } });
@@ -254,41 +254,75 @@ return view.extend({
 			if (!ok)
 				return;
 
+			// 点击立刻按「已阻断」重绘，视觉上点了就生效
+			optimisticDevices(x.mac, true);
 			callKick(x.mac, x.ip || '').then(function(r) {
 				ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已断开'));
-				return refresh(true);
+				return loadDevices(true).catch(function() {});	// 再按后端真实结果校准
 			}).catch(function(e) {
+				optimisticDevices(x.mac, false);	// 失败回滚
 				ui.addNotification(null, E('p', {}, '操作失败：' + e.message));
 			});
 		}
 
 		function unkickDevice(x) {
+			// 点击立刻按「已解除」重绘
+			optimisticDevices(x.mac, false);
 			callUnkick(x.mac).then(function(r) {
 				ui.addNotification(null, E('p', {}, (r && r.message) ? r.message : '已解除阻断'));
-				return refresh(true);
+				return loadDevices(true).catch(function() {});
 			}).catch(function(e) {
+				optimisticDevices(x.mac, true);	// 失败回滚
 				ui.addNotification(null, E('p', {}, '操作失败：' + e.message));
 			});
 		}
 
-		var devLastNonEmpty = 0;
+		// 设备列表最近一次完整结果 + 请求序号 + 一个「短暂保护窗」。
+		// 目的：点「断开/解除」时先乐观重绘（点击即反应），并在这之后的几秒内
+		// 忽略「读缓存」的旧设备响应，避免 devwatch 还没刷新时把界面又改回去。
+		var lastDevices = null;
+		var devSeq = 0, devAppliedSeq = 0, devHoldUntil = 0;
+
+		// 立刻把某台设备按「已阻断 / 已解除」重绘，不等后端往返。
+		function optimisticDevices(mac, blocked) {
+			devAppliedSeq = ++devSeq;
+			devHoldUntil = Date.now() + 8000;
+			if (!lastDevices)
+				return;
+			lastDevices.forEach(function(x) {
+				if (x.mac !== mac)
+					return;
+				x.blocked = blocked ? 1 : 0;
+				x.online = blocked ? 0 : 1;
+			});
+			applyDevices({ devices: lastDevices });
+		}
+
+		// 拉设备列表并应用。force=false 读缓存；返回的强制探测结果总能覆盖。
+		// seq 保证晚到的旧响应不会覆盖较新的结果；保护窗内忽略读缓存的旧结果。
+		function loadDevices(force) {
+			var seq = ++devSeq;
+			var forced = (force === true);
+			return callDevices(forced ? 1 : 0).then(function(d) {
+				if (!forced && Date.now() < devHoldUntil)
+					return;
+				if (seq < devAppliedSeq)
+					return;
+				devAppliedSeq = seq;
+				applyDevices(d);
+			});
+		}
 
 		function applyDevices(d) {
 			var all = (d && d.devices) || [];
+			lastDevices = all;
 
 			// 只显示「在线」和「已阻断」的设备。
-			// 断开的设备（无线掉了 / ARP 不通）直接不显示，而不是留一行灰的。
+			// 断开的设备（无线掉了 / 拔了网线 / ARP 不通）直接不显示，而不是留一行灰的。
 			// 已阻断的必须留着，否则就没有「解除」按钮了。
 			var list = all.filter(function(x) {
 				return parseInt(x.online) == 1 || parseInt(x.blocked) == 1;
 			});
-
-			// 空结果去抖：后端偶发空响应时不要立刻清空列表（否则会"闪一下 0 台在线"）
-			var nowMs = Date.now();
-			if (list.length)
-				devLastNonEmpty = nowMs;
-			else if (devLastNonEmpty > 0 && (nowMs - devLastNonEmpty) < 15000)
-				return;
 
 			while (devList.firstChild)
 				devList.removeChild(devList.firstChild);
@@ -369,7 +403,7 @@ return view.extend({
 		// 严格串行：先状态，再设备、最后日志。并发 RPC 在 LuCI 26 上会卡住页面。
 		// 设备列表放在日志前面：日志要读 80 行，慢的时候会让设备区一直停在「加载中」。
 		// force=true 用于手动刷新与按钮操作后立刻拉一遍。
-		function refresh(force) {
+		function doRefresh(force) {
 			var wantLog = (force === true) || (tick % SLOW_EVERY) === 0;
 			tick++;
 
@@ -381,7 +415,8 @@ return view.extend({
 			}).then(function() {
 				// 设备列表读的是后端缓存（后台每 5 秒刷新），响应很快，所以每轮都拉；
 				// 日志要读 80 行、比较慢，仍每 3 轮（15 秒）拉一次。
-				return callDevices().then(applyDevices).catch(function() {
+				// 手动刷新（force）时让后端跳过缓存、现场探测一次，拔线/插线立刻反映
+				return loadDevices(force === true).catch(function() {
 					while (devList.firstChild)
 						devList.removeChild(devList.firstChild);
 					devCount.textContent = '读取失败';
@@ -392,6 +427,25 @@ return view.extend({
 					return null;
 				return fetchLog();
 			});
+		}
+
+		// 同一时刻只允许一条刷新链在跑：轮询与按钮触发的刷新若并发，
+		// 会同时发出多组 status/devices/log RPC，正是历史上导致页面卡死的 RPC 合批场景。
+		var refreshing = null, refreshQueued = false;
+		function refresh(force) {
+			if (refreshing) {
+				if (force === true)
+					refreshQueued = true;
+				return refreshing;
+			}
+			refreshing = doRefresh(force).finally(function() {
+				refreshing = null;
+				if (refreshQueued) {
+					refreshQueued = false;
+					refresh(true);
+				}
+			});
+			return refreshing;
 		}
 
 		function actionBtn(label, cls, fn) {
@@ -454,7 +508,8 @@ return view.extend({
 		devReload.addEventListener('click', function(ev) {
 			ev.preventDefault();
 			devReload.disabled = true;
-			refresh(true).finally(function() { devReload.disabled = false; });
+			// 直接强制现场探测并刷新，不排在轮询刷新后面
+			loadDevices(true).catch(function() {}).finally(function() { devReload.disabled = false; });
 		});
 
 		devicesBox = section([

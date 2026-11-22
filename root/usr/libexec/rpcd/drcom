@@ -22,45 +22,92 @@ cfg() {
 # ---------- 阻断相关 ----------
 
 # 初始化/修复 nft 表：幂等，表/集合/链/规则缺哪个补哪个。
-# 之前只要表在就直接 return，若上次初始化中途失败（表建了、链或规则没建上），
-# drop 规则就永远不会补上，阻断会静默失效。
+# 任何一步失败都会设置 NFT_ERR 并返回非 0，避免「规则其实没装上、却回报已阻断」。
 NFT_ERR=""
+NFT_SIG="$STATE_DIR/nft.sig"
+nft_ok() { nft list "$@" >/dev/null 2>&1; }
+
 nft_table_init() {
 	NFT_ERR=""
-	if ! nft list table bridge drcom_block >/dev/null 2>&1; then
+	if ! nft_ok table bridge drcom_block; then
 		if ! nft add table bridge drcom_block 2>/dev/null; then
 			NFT_ERR="当前固件不支持 nft bridge（缺少 bridge 家族支持），设备阻断不可用"
 			logger -t drcom-portal "[操作] $NFT_ERR" 2>/dev/null
 			return 1
 		fi
 	fi
-	nft list set bridge drcom_block blocked >/dev/null 2>&1 \
-		|| nft add set bridge drcom_block blocked '{ type ether_addr; }' 2>/dev/null
-	nft list chain bridge drcom_block input >/dev/null 2>&1 \
-		|| nft add chain bridge drcom_block input '{ type filter hook input priority -10; policy accept; }' 2>/dev/null
-	nft list chain bridge drcom_block forward >/dev/null 2>&1 \
-		|| nft add chain bridge drcom_block forward '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null
+	if ! nft_ok set bridge drcom_block blocked; then
+		nft add set bridge drcom_block blocked '{ type ether_addr; }' 2>/dev/null \
+			|| NFT_ERR="无法创建 nft 阻断集合 blocked"
+	fi
+	if [ -z "$NFT_ERR" ] && ! nft_ok chain bridge drcom_block input; then
+		nft add chain bridge drcom_block input '{ type filter hook input priority -10; policy accept; }' 2>/dev/null \
+			|| NFT_ERR="无法创建 nft 阻断链 input"
+	fi
+	if [ -z "$NFT_ERR" ] && ! nft_ok chain bridge drcom_block forward; then
+		nft add chain bridge drcom_block forward '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null \
+			|| NFT_ERR="无法创建 nft 阻断链 forward"
+	fi
 	# 只丢弃「单播」帧：广播（DHCP/ARP）照常放行，这样被断的设备还能保持关联，
 	# 解除后流量立刻恢复（不发 deauth 就是为了这个）。
-	nft list chain bridge drcom_block input 2>/dev/null | grep -q 'ether saddr @blocked' \
-		|| nft 'add rule bridge drcom_block input ether saddr @blocked ether daddr != ff:ff:ff:ff:ff:ff drop' 2>/dev/null
-	nft list chain bridge drcom_block forward 2>/dev/null | grep -q 'ether saddr @blocked' \
-		|| nft 'add rule bridge drcom_block forward ether saddr @blocked ether daddr != ff:ff:ff:ff:ff:ff drop' 2>/dev/null
+	if [ -z "$NFT_ERR" ] && ! nft list chain bridge drcom_block input 2>/dev/null | grep -q 'ether saddr @blocked'; then
+		nft 'add rule bridge drcom_block input ether saddr @blocked ether daddr != ff:ff:ff:ff:ff:ff drop' 2>/dev/null \
+			|| NFT_ERR="无法创建 nft 阻断规则 input"
+	fi
+	if [ -z "$NFT_ERR" ] && ! nft list chain bridge drcom_block forward 2>/dev/null | grep -q 'ether saddr @blocked'; then
+		nft 'add rule bridge drcom_block forward ether saddr @blocked ether daddr != ff:ff:ff:ff:ff:ff drop' 2>/dev/null \
+			|| NFT_ERR="无法创建 nft 阻断规则 forward"
+	fi
+	# 最终确认链挂了正确的 hook、且两条 drop 规则真的存在，否则不要谎报成功
+	if [ -z "$NFT_ERR" ] \
+	   && ! { nft list chain bridge drcom_block input 2>/dev/null | grep -q 'hook input' \
+	          && nft list chain bridge drcom_block input 2>/dev/null | grep -q 'ether saddr @blocked' \
+	          && nft list chain bridge drcom_block forward 2>/dev/null | grep -q 'hook forward' \
+	          && nft list chain bridge drcom_block forward 2>/dev/null | grep -q 'ether saddr @blocked'; }; then
+		NFT_ERR="nft 阻断规则未生效（链 hook 或 drop 规则缺失，固件可能不支持 bridge 过滤）"
+	fi
+	if [ -n "$NFT_ERR" ]; then
+		logger -t drcom-portal "[操作] $NFT_ERR" 2>/dev/null
+		return 1
+	fi
 	return 0
 }
 
-# 让内核里的阻断集合与 BLOCK 文件保持一致（文件为空就把表删掉，不留残留）
+# 让内核里的阻断集合与 BLOCK 文件保持一致（文件为空就把表删掉，不留残留）。
+# 只有名单内容变了（或表被外部删除）才真正下发，避免 devwatch 每 ~5 秒
+# flush + 逐条重加：既省 CPU，也不会出现「flush 后短暂全部放行」的窗口。
+# 下发用一个 nft -f 事务完成，原子生效。
 nft_sync_blocks() {
-	local mac exp
+	local sig
+	mkdir -p "$STATE_DIR" 2>/dev/null
 	if [ ! -s "$BLOCK" ]; then
 		nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
+		rm -f "$NFT_SIG" 2>/dev/null
+		return 0
+	fi
+	sig=$(md5sum "$BLOCK" 2>/dev/null | awk '{ print $1 }')
+	if [ -n "$sig" ] && [ "$sig" = "$(cat "$NFT_SIG" 2>/dev/null)" ] \
+	   && nft list table bridge drcom_block >/dev/null 2>&1; then
 		return 0
 	fi
 	nft_table_init || return 1
-	nft flush set bridge drcom_block blocked 2>/dev/null
-	while read -r mac; do
-		[ -n "$mac" ] && nft add element bridge drcom_block blocked "{ $mac }" 2>/dev/null
-	done < "$BLOCK"
+	{
+		echo "flush set bridge drcom_block blocked"
+		while read -r mac; do
+			[ -n "$mac" ] && echo "add element bridge drcom_block blocked { $mac }"
+		done < "$BLOCK"
+	} | nft -f - 2>"$STATE_DIR/.nfterr"
+	if [ $? -ne 0 ]; then
+		NFT_ERR="下发阻断名单失败：$(head -c 200 "$STATE_DIR/.nfterr" 2>/dev/null | tr '\n' ' ')"
+		rm -f "$STATE_DIR/.nfterr" 2>/dev/null
+		logger -t drcom-portal "[操作] $NFT_ERR" 2>/dev/null
+		return 1
+	fi
+	rm -f "$STATE_DIR/.nfterr" 2>/dev/null
+	if [ -n "$sig" ]; then
+		printf '%s' "$sig" > "$NFT_SIG" 2>/dev/null
+		chmod 600 "$NFT_SIG" 2>/dev/null
+	fi
 	return 0
 }
 
@@ -224,11 +271,17 @@ collect_devices() {
 		done < "$BLOCK"
 	fi
 
-	# 有线设备并发探一次（无线看 station 列表，不需要探；阻断中的也不探）
+	# 有线设备每轮都强制重新解析一次 ARP。
+	# 注意：只 ping 一个仍是 REACHABLE 的邻居，内核会直接复用缓存里的 MAC、不会重新
+	# 去问「你还在不在」，所以拔线后要等内核自己的超时（约 30~45 秒）才会变 —— 表现
+	# 就是「拔了网线设备还挂在线」。先 flush 掉邻居项再 ping，就能在一个探测周期
+	# （约 5 秒）内准确判断对面还有没有人应答：在线的会重新变 REACHABLE，拔掉的会
+	# 变成 INCOMPLETE/FAILED。无线设备看 station 列表，不需要这一套；阻断中的也不探。
 	while IFS='|' read -r mac name ip; do
 		[ -n "$ip" ] || continue
 		grep -qx "$mac" "$wl" 2>/dev/null && continue
 		[ -n "$(is_blocked "$mac")" ] && continue
+		ip neigh flush to "$ip" dev "$landev" >/dev/null 2>&1
 		ping -c 1 -W 1 "$ip" >/dev/null 2>&1 &
 	done < "$cand"
 	wait
@@ -329,12 +382,23 @@ dev_probe_cache() {
 	fi
 }
 
-# 界面调用：优先用新鲜缓存（≤30 秒），否则现场探测一次
+# 界面调用：优先用新鲜缓存（≤30 秒），否则现场探测一次。
+# 带 {"force":1} 时跳过缓存、立刻现场探测（界面点「刷新」用），
+# 保证拔线 / 插线后点刷新马上反映，而不是等下一次后台探测。
 method_devices() {
-	local ts age
+	local ts age req force=0
+	IFS= read -r req 2>/dev/null
+	# LuCI 传的是布尔 true（jsonfilter 输出 "true"），命令行 / ubus 习惯传 1，两种都认
+	case "$(printf '%s' "$req" | jsonfilter -e '@.force' 2>/dev/null)" in
+		1|true) force=1 ;;
+	esac
 	ts=$(cat "$DEVCACHE_TS" 2>/dev/null)
 	case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
 	age=$(( $(date +%s) - ts ))
+	if [ "$force" = "1" ]; then
+		dev_probe_cache
+		[ -s "$DEVCACHE" ] && { cat "$DEVCACHE"; return 0; }
+	fi
 	if [ -s "$DEVCACHE" ] && [ "$age" -lt "$DEVCACHE_MAX_AGE" ]; then
 		cat "$DEVCACHE"
 		return 0
