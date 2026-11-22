@@ -396,6 +396,18 @@ on_stop() {
 	exit 0
 }
 
+# 后台定时探测设备列表并写缓存：界面打开时直接读缓存，不用等 1 秒探测；
+# 插拔网线也由这里统一刷新，而不是每次请求各探一次。
+devwatch_loop() {
+	LOG_TAG="[自动]"
+	MIRROR_SYSLOG=0
+	trap 'exit 0' TERM INT
+	while true; do
+		sh /usr/libexec/rpcd/drcom devprobe >/dev/null 2>&1
+		do_sleep 5
+	done
+}
+
 watch_loop() {
 	# 守护循环自己写 syslog（procd 收集 stdout），标成「自动」，别再重复 logger
 	LOG_TAG="[自动]"
@@ -513,7 +525,8 @@ case "$1" in
 	login)   do_relogin ;;
 	status)  do_status ;;
 	watch)   watch_loop ;;
+	devwatch) devwatch_loop ;;
 	wake)    do_wake ;;
 	idle)    do_idle ;;
-	*) echo "用法: $0 {online|offline|login|status|watch|wake|idle}"; exit 1 ;;
+	*) echo "用法: $0 {online|offline|login|status|watch|devwatch|wake|idle}"; exit 1 ;;
 esac

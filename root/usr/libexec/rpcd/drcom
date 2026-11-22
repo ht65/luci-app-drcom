@@ -142,6 +142,17 @@ method_log() {
 
 # ---------- 设备列表 ----------
 
+# 设备状态由后台定时探测写入缓存（drcom-portal devwatch），界面读缓存，
+# 这样打开页面不用等 1 秒的探测，也避免多个请求并发跑同一套探测。
+DEVCACHE="$STATE_DIR/devcache"
+DEVCACHE_TS="$STATE_DIR/devcache.ts"
+DEVCACHE_MAX_AGE=30
+
+# 临时文件按进程号区分：否则两个并发请求会互相覆盖，出现「突然 0 台在线」
+dev_tmp() {
+	printf '%s/%s.%s' "$STATE_DIR" "$1" "$$"
+}
+
 # 有线设备的在线判定必须「主动探测」：网线拔掉后内核不会主动重验 ARP，
 # 邻居表可能长时间停在 REACHABLE，只信这个状态就会出现「设备几分钟后才消失」。
 # 所以每轮都对有线设备并发发一个包触发 ARP 重新解析（并发执行，整体约 1 秒）。
@@ -166,9 +177,9 @@ list_stations() {
 	done
 }
 
-method_devices() {
-	local wl="$STATE_DIR/.wl" nb="$STATE_DIR/.nb" ne="$STATE_DIR/.meta.new"
-	local cand="$STATE_DIR/.cand" landev mac ip host exp cid
+collect_devices() {
+	local wl nb ne cand landev mac ip host exp cid
+	wl=$(dev_tmp .wl); nb=$(dev_tmp .nb); ne=$(dev_tmp .meta); cand=$(dev_tmp .cand)
 	local on wifi nip state seen n=0 now blk name
 
 	now=$(date +%s)
@@ -295,10 +306,40 @@ method_devices() {
 	chmod 600 "$META" 2>/dev/null
 
 	# devmeta 只增不减会越积越多：超过 30 天没出现过的设备顺手清掉
-	awk -v n="$now" '$3 == 0 || $3 + 0 > n - 2592000' "$META" > "$META.new" 2>/dev/null \
-		&& mv "$META.new" "$META" 2>/dev/null
+	local prune
+	prune=$(dev_tmp .meta.prune)
+	awk -v n="$now" '$3 == 0 || $3 + 0 > n - 2592000' "$META" > "$prune" 2>/dev/null \
+		&& mv "$prune" "$META" 2>/dev/null
+	rm -f "$prune" 2>/dev/null
 
 	rm -f "$wl" "$nb" "$cand" 2>/dev/null
+}
+
+# 探测一次并写缓存（由后台 devwatch 调用）
+dev_probe_cache() {
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	collect_devices > "$DEVCACHE.tmp.$$" 2>/dev/null
+	if [ -s "$DEVCACHE.tmp.$$" ]; then
+		mv "$DEVCACHE.tmp.$$" "$DEVCACHE"
+		chmod 600 "$DEVCACHE" 2>/dev/null
+		date +%s > "$DEVCACHE_TS"
+		chmod 600 "$DEVCACHE_TS" 2>/dev/null
+	else
+		rm -f "$DEVCACHE.tmp.$$" 2>/dev/null
+	fi
+}
+
+# 界面调用：优先用新鲜缓存（≤30 秒），否则现场探测一次
+method_devices() {
+	local ts age
+	ts=$(cat "$DEVCACHE_TS" 2>/dev/null)
+	case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+	age=$(( $(date +%s) - ts ))
+	if [ -s "$DEVCACHE" ] && [ "$age" -lt "$DEVCACHE_MAX_AGE" ]; then
+		cat "$DEVCACHE"
+		return 0
+	fi
+	collect_devices
 }
 
 # ---------- 断开设备 ----------
@@ -496,5 +537,9 @@ case "$1" in
 	purge)
 		# 供 init.d / 守护进程调用：把 /etc/drcom.blocked 里的名单同步到内核
 		block_purge
+		;;
+	devprobe)
+		# 供后台 devwatch 调用：探测一次设备并刷新缓存
+		dev_probe_cache
 		;;
 esac

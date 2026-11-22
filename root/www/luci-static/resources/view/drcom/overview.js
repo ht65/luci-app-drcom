@@ -271,6 +271,8 @@ return view.extend({
 			});
 		}
 
+		var devLastNonEmpty = 0;
+
 		function applyDevices(d) {
 			var all = (d && d.devices) || [];
 
@@ -280,6 +282,13 @@ return view.extend({
 			var list = all.filter(function(x) {
 				return parseInt(x.online) == 1 || parseInt(x.blocked) == 1;
 			});
+
+			// 空结果去抖：后端偶发空响应时不要立刻清空列表（否则会"闪一下 0 台在线"）
+			var nowMs = Date.now();
+			if (list.length)
+				devLastNonEmpty = nowMs;
+			else if (devLastNonEmpty > 0 && (nowMs - devLastNonEmpty) < 15000)
+				return;
 
 			while (devList.firstChild)
 				devList.removeChild(devList.firstChild);
@@ -361,7 +370,7 @@ return view.extend({
 		// 设备列表放在日志前面：日志要读 80 行，慢的时候会让设备区一直停在「加载中」。
 		// force=true 用于手动刷新与按钮操作后立刻拉一遍。
 		function refresh(force) {
-			var wantSlow = (force === true) || (tick % SLOW_EVERY) === 0;
+			var wantLog = (force === true) || (tick % SLOW_EVERY) === 0;
 			tick++;
 
 			return callStatus().then(function(st) {
@@ -370,14 +379,18 @@ return view.extend({
 				badge.textContent = '状态获取失败';
 				badge.style.background = '#c62828';
 			}).then(function() {
-				if (!wantSlow)
-					return null;
+				// 设备列表读的是后端缓存（后台每 5 秒刷新），响应很快，所以每轮都拉；
+				// 日志要读 80 行、比较慢，仍每 3 轮（15 秒）拉一次。
 				return callDevices().then(applyDevices).catch(function() {
 					while (devList.firstChild)
 						devList.removeChild(devList.firstChild);
 					devCount.textContent = '读取失败';
 					devList.appendChild(E('p', { 'class': 'drcom-note' }, '（读取设备列表失败，可点「刷新」重试）'));
-				}).then(fetchLog);
+				});
+			}).then(function() {
+				if (!wantLog)
+					return null;
+				return fetchLog();
 			});
 		}
 
