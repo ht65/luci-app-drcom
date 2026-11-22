@@ -142,37 +142,11 @@ method_log() {
 
 # ---------- 设备列表 ----------
 
-# 有线设备 ARP 处于 STALE/缺失时，发个包触发一次解析再判断在线；
-# 结果缓存 30 秒，避免每轮轮询都为每台设备白等 1 秒。
-probe_wired() {
-	local mac="$1" ip="$2" landev="$3" cache="$STATE_DIR/.probe"
-	local now ts res st
+# 有线设备的在线判定必须「主动探测」：网线拔掉后内核不会主动重验 ARP，
+# 邻居表可能长时间停在 REACHABLE，只信这个状态就会出现「设备几分钟后才消失」。
+# 所以每轮都对有线设备并发发一个包触发 ARP 重新解析（并发执行，整体约 1 秒）。
 
-	now=$(date +%s)
-	st=$(awk -v m="$mac" '$1 == m { print $2, $3; exit }' "$cache" 2>/dev/null)
-	set -- $st
-	if [ -n "$1" ] && [ $((now - $1)) -lt 30 ] 2>/dev/null; then
-		[ "$2" = "1" ] && return 0
-		return 1
-	fi
-
-	ping -c 1 -W 1 "$ip" >/dev/null 2>&1
-	case "$(ip neigh show "$ip" dev "$landev" 2>/dev/null | awk '{ print $NF }')" in
-		REACHABLE|DELAY|PROBE) res=1 ;;
-		*) res=0 ;;
-	esac
-
-	mkdir -p "$STATE_DIR" 2>/dev/null
-	{
-		[ -f "$cache" ] && awk -v m="$mac" '$1 != m' "$cache"
-		printf '%s %s %s\n' "$mac" "$now" "$res"
-	} > "$cache.new" 2>/dev/null
-	mv "$cache.new" "$cache" 2>/dev/null
-
-	[ "$res" = "1" ]
-}
-
-# 找出所有 AP 模式接口上的 station -> "mac" 每行一个
+# 找出所有 AP 模式接口上的 station -> 每行一个 mac（无线设备在线判定的依据）
 list_stations() {
 	local d
 	if ! command -v iw >/dev/null 2>&1; then
@@ -194,43 +168,77 @@ list_stations() {
 
 method_devices() {
 	local wl="$STATE_DIR/.wl" nb="$STATE_DIR/.nb" ne="$STATE_DIR/.meta.new"
-	local landev mac ip host exp cid on wifi nip state left seen n=0 now
+	local cand="$STATE_DIR/.cand" landev mac ip host exp cid
+	local on wifi nip state seen n=0 now blk name
 
 	now=$(date +%s)
-
 	landev=$(uci -q get network.lan.device)
 	[ -n "$landev" ] || landev=br-lan
-
 	mkdir -p "$STATE_DIR" 2>/dev/null
-	block_purge
 
+	block_purge
 	list_stations > "$wl"
 
-	# 邻居表：mac ip state（只要 IPv4，且跳过 FAILED —— 那表示已经探测不到了）
+	# 邻居表：mac ip state（只要 IPv4，跳过 FAILED）
 	ip neigh show dev "$landev" 2>/dev/null \
 		| awk '{ if ($1 ~ /:/ || $NF == "FAILED") next;
 			 ip = $1; mac = ""; for (i = 1; i <= NF; i++) if ($i == "lladdr") mac = $(i + 1);
 			 if (mac != "") printf "%s %s %s\n", tolower(mac), ip, $NF }' > "$nb"
 
-	: > "$ne"
+	: > "$cand"
 
-	json_init
-	json_add_array devices
-
-	# 先按 DHCP 租约列出（有主机名）
+	# 候选 1：DHCP 租约（带主机名）
 	while read -r exp mac ip host cid; do
 		[ -n "$mac" ] || continue
 		mac=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
 		[ "$host" = "*" ] && host=""
-
 		nip=$(awk -v m="$mac" '$1 == m { print $2; exit }' "$nb")
 		[ -n "$nip" ] && ip="$nip"
+		printf '%s|%s|%s\n' "$mac" "$host" "$ip" >> "$cand"
+	done < /tmp/dhcp.leases
 
-		# 无线还是有线：当前在 station 列表里就是无线；否则沿用历史记录
-		if grep -qx "$mac" "$wl" 2>/dev/null; then
-			wifi=1
-		else
-			wifi=0
+	# 候选 2：邻居表里有、但没有租约的设备（静态 IP）
+	while read -r mac ip state; do
+		[ -n "$mac" ] || continue
+		grep -q "^$mac|" "$cand" 2>/dev/null && continue
+		printf '%s|%s|%s\n' "$mac" "" "$ip" >> "$cand"
+	done < "$nb"
+
+	# 候选 3：还在阻断名单里、但上面都没列到的（保证界面上一定有点「解除」的入口）
+	if [ -s "$BLOCK" ]; then
+		while read -r mac; do
+			[ -n "$mac" ] || continue
+			grep -q "^$mac|" "$cand" 2>/dev/null && continue
+			printf '%s|%s|%s\n' "$mac" "" "" >> "$cand"
+		done < "$BLOCK"
+	fi
+
+	# 有线设备并发探一次（无线看 station 列表，不需要探；阻断中的也不探）
+	while IFS='|' read -r mac name ip; do
+		[ -n "$ip" ] || continue
+		grep -qx "$mac" "$wl" 2>/dev/null && continue
+		[ -n "$(is_blocked "$mac")" ] && continue
+		ping -c 1 -W 1 "$ip" >/dev/null 2>&1 &
+	done < "$cand"
+	wait
+
+	# 探测后再取一次邻居表（ping 已经触发 ARP 重新解析，状态才是最新的）
+	ip neigh show dev "$landev" 2>/dev/null \
+		| awk '{ if ($1 ~ /:/ || $NF == "FAILED") next;
+			 ip = $1; mac = ""; for (i = 1; i <= NF; i++) if ($i == "lladdr") mac = $(i + 1);
+			 if (mac != "") printf "%s %s %s\n", tolower(mac), ip, $NF }' > "$nb"
+
+	json_init
+	json_add_array devices
+	: > "$ne"
+
+	while IFS='|' read -r mac name ip; do
+		[ -n "$mac" ] || continue
+
+		# 无线还是有线：当前在 station 列表里就是无线，否则沿用历史记录
+		wifi=0
+		grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
+		if [ "$wifi" = "0" ]; then
 			case "$(awk -v m="$mac" '$1 == m { print $2; exit }' "$META" 2>/dev/null)" in
 				w) wifi=1 ;;
 			esac
@@ -238,25 +246,19 @@ method_devices() {
 
 		blk=$(is_blocked "$mac")
 
-		if [ "$wifi" = "1" ]; then
-			# 无线设备以 station 是否存在为准：断开后立刻判定离线
+		if [ -n "$blk" ]; then
+			on=0
+		elif [ "$wifi" = "1" ]; then
+			# 无线设备以 station 是否存在为准
 			grep -qx "$mac" "$wl" 2>/dev/null && on=1 || on=0
 		else
+			# 有线设备以「探测之后的 ARP 状态」为准：只有活跃状态才算在线
 			state=$(awk -v m="$mac" '$1 == m { print $3; exit }' "$nb")
 			case "$state" in
 				REACHABLE|DELAY|PROBE) on=1 ;;
-				*)
-					# 阻断中的设备必然 ping 不通，跳过探测（否则每轮白等 1 秒）
-					if [ -n "$blk" ]; then
-						on=0
-					else
-						probe_wired "$mac" "$ip" "$landev" && on=1 || on=0
-					fi
-					;;
+				*) on=0 ;;
 			esac
 		fi
-
-		[ -n "$blk" ] && on=0
 
 		if [ "$on" = "1" ]; then
 			seen=$now
@@ -267,7 +269,7 @@ method_devices() {
 		printf '%s %s %s\n' "$mac" "$( [ "$wifi" = 1 ] && echo w || echo e )" "$seen" >> "$ne"
 
 		json_add_object
-		json_add_string name      "$host"
+		json_add_string name      "$name"
 		json_add_string ip        "$ip"
 		json_add_string mac       "$mac"
 		json_add_int    online    "$on"
@@ -276,53 +278,7 @@ method_devices() {
 		json_add_string last_seen "$seen"
 		json_close_object
 		n=$((n + 1))
-	done < /tmp/dhcp.leases
-
-	# 再补上邻居表里有、但没有 DHCP 租约的设备（静态 IP）
-	while read -r mac ip state; do
-		[ -n "$mac" ] || continue
-		grep -q "^$mac " "$ne" 2>/dev/null && continue
-		wifi=0
-		grep -qx "$mac" "$wl" 2>/dev/null && wifi=1
-		blk=$(is_blocked "$mac")
-		case "$state" in
-			REACHABLE|DELAY|PROBE) on=1 ;;
-			*) on=0 ;;
-		esac
-		[ -n "$blk" ] && on=0
-		[ "$on" = "1" ] && seen=$now || seen=0
-		printf '%s %s %s\n' "$mac" "$( [ "$wifi" = 1 ] && echo w || echo e )" "$seen" >> "$ne"
-		json_add_object
-		json_add_string name      ""
-		json_add_string ip        "$ip"
-		json_add_string mac       "$mac"
-		json_add_int    online    "$on"
-		json_add_int    wireless  "$wifi"
-		json_add_int    blocked   "$( [ -n "$blk" ] && echo 1 || echo 0 )"
-		json_add_string last_seen "$seen"
-		json_close_object
-		n=$((n + 1))
-	done < "$nb"
-
-	# 阻断名单里如果还有不在上面的 MAC（租约过期、ARP 也消失了），补一条出来，
-	# 否则界面上就找不到「解除」按钮了
-	if [ -s "$BLOCK" ]; then
-		while read -r mac; do
-			[ -n "$mac" ] || continue
-			grep -q "^$mac " "$ne" 2>/dev/null && continue
-			printf '%s %s %s\n' "$mac" e 0 >> "$ne" 2>/dev/null
-			json_add_object
-			json_add_string name      ""
-			json_add_string ip        ""
-			json_add_string mac       "$mac"
-			json_add_int    online    0
-			json_add_int    wireless  0
-			json_add_int    blocked   1
-			json_add_string last_seen "0"
-			json_close_object
-			n=$((n + 1))
-		done < "$BLOCK"
-	fi
+	done < "$cand"
 
 	json_close_array
 	json_add_int count "$n"
@@ -342,7 +298,7 @@ method_devices() {
 	awk -v n="$now" '$3 == 0 || $3 + 0 > n - 2592000' "$META" > "$META.new" 2>/dev/null \
 		&& mv "$META.new" "$META" 2>/dev/null
 
-	rm -f "$wl" "$nb" 2>/dev/null
+	rm -f "$wl" "$nb" "$cand" 2>/dev/null
 }
 
 # ---------- 断开设备 ----------
