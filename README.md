@@ -48,7 +48,7 @@
 
 ```sh
 cd /tmp
-wget -O drcom.tar.gz https://github.com/ht65/luci-app-drcom/releases/download/v1.0.12/luci-app-drcom-1.0.12.tar.gz
+wget -O drcom.tar.gz https://github.com/ht65/luci-app-drcom/releases/download/v1.0.13/luci-app-drcom-1.0.13.tar.gz
 tar -xzf drcom.tar.gz
 cd luci-app-drcom
 sh install.sh
@@ -66,10 +66,10 @@ sh install.sh
 
 ImmortalWrt 25.12 起包管理器换成了 apk-tools 3，安装包是带签名的 v3 格式（二进制 ADB 容器），只能在 Linux 环境用 SDK 编译产出，手工打包不可行。
 
-本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-<版本>-r1.apk`（当前为 `luci-app-drcom-1.0.12-r1.apk`），然后在路由器上：
+本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-<版本>-r1.apk`（当前为 `luci-app-drcom-1.0.13-r1.apk`），然后在路由器上：
 
 ```sh
-apk add --allow-untrusted ./luci-app-drcom-1.0.12-r1.apk
+apk add --allow-untrusted ./luci-app-drcom-1.0.13-r1.apk
 ```
 
 用 apk 安装的好处是：它会正常出现在 LuCI 的「软件包」列表里，也能用 `apk del luci-app-drcom` 卸载。

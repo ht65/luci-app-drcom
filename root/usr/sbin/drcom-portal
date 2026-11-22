@@ -186,6 +186,41 @@ iface_up() {
 	[ "$(ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]
 }
 
+# 取该接口 netifd 认为的默认网关。只有 netifd 确实认为该接口「有默认路由」时才返回，
+# 免得用户特意配置「不带默认路由」的上行时被我们擅自加一条。
+# 谓词写法要较新的 jsonfilter 才支持，老版本退回按 index 取，并校验第一条确实指向 0.0.0.0。
+iface_gateway() {
+	local n pair t
+	n=$(ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null)
+	if [ -z "$n" ]; then
+		pair=$(ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.route[0].target' -e '@.route[0].nexthop' 2>/dev/null)
+		t=$(printf '%s\n' "$pair" | head -1)
+		[ "$t" = "0.0.0.0" ] && n=$(printf '%s\n' "$pair" | tail -1)
+	fi
+	printf '%s' "$n"
+}
+
+# 逻辑接口对应的内核设备名（例如 wwan -> phy1-sta0）。ip route 必须用物理设备名。
+iface_l3dev() {
+	ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null
+}
+
+# netifd 与内核路由表偶发不同步，典型场景：插过 USB / CPE 上行并由它提供默认路由，
+# 拔掉之后 netifd 仍以为 wwan 的默认路由还在，内核里那条却被删了。结果是接口有 IP、
+# 却完全上不了外网，插件会一直报「认证服务器无响应」。这里在内核确实没有默认路由时，
+# 按 netifd 已知网关补一条（不重启接口，避免扰动共用射频的 AP / 无线）。
+ensure_default_route() {
+	local up="$1" gw dev
+	ip route 2>/dev/null | grep -q '^default ' && return 0
+	gw=$(iface_gateway "$up")
+	[ -n "$gw" ] || return 1
+	dev=$(iface_l3dev "$up")
+	[ -n "$dev" ] || return 1
+	ip route replace default via "$gw" dev "$dev" 2>/dev/null || return 1
+	log "上行 $up 有 IP 但内核缺少默认路由（netifd 不同步），已补上：default via $gw dev $dev"
+	return 0
+}
+
 # auto: 优先无线中继(wwan)，其次有线(wan)，取第一个拿到 IP 的；
 # 都没有 IP 时退回第一个「接口已 up」的，避免 ifdown/ifup 打到无关/不存在的接口。
 resolve_uplink() {
@@ -329,6 +364,8 @@ do_online() {
 		return 3
 	fi
 
+	ensure_default_route "$up"
+
 	if probe_online; then
 		clear_error
 		log "上线完成，无需重新认证"
@@ -351,6 +388,7 @@ do_relogin() {
 
 	up=$(resolve_uplink)
 	ip=$(iface_ip "$up")
+	ensure_default_route "$up"
 
 	if probe_online; then
 		clear_error
@@ -381,6 +419,11 @@ do_status() {
 
 	echo "上行接口: $up"
 	echo "上行地址: ${ip:-未获取}"
+	if ip route 2>/dev/null | grep -q '^default '; then
+		echo "默认路由: 有"
+	else
+		echo "默认路由: 无（可能 netifd 与内核不同步，守护会尝试自动补回）"
+	fi
 	echo "账号:     ${ACCOUNT:-未配置}"
 	echo "终端类型: $TERMINAL_TYPE"
 	echo "认证服务器: $(server_cached):$PORTAL_PORT"
@@ -471,6 +514,9 @@ watch_loop() {
 			do_sleep 10
 			continue
 		fi
+
+		# 内核缺默认路由时（netifd 不同步）先补回来，否则认证服务器永远不可达
+		ensure_default_route "$up"
 
 		# 用户手动下线后暂停自动认证，直到点「上线」或重启路由器（标记在 /etc，可跨重启）
 		if [ -f "$PAUSE_FILE" ]; then
