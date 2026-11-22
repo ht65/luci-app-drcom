@@ -402,6 +402,9 @@ devwatch_loop() {
 	LOG_TAG="[自动]"
 	MIRROR_SYSLOG=0
 	trap 'exit 0' TERM INT
+
+	# 上次被强杀时可能留下临时文件，开工前清一次
+	rm -f "$STATE_DIR"/.wl.* "$STATE_DIR"/.nb.* "$STATE_DIR"/.meta.* "$STATE_DIR"/.cand.* "$STATE_DIR"/devcache.tmp.* "$STATE_DIR"/.probe 2>/dev/null
 	while true; do
 		sh /usr/libexec/rpcd/drcom devprobe >/dev/null 2>&1
 		do_sleep 5
