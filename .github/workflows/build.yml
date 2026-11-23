@@ -84,6 +84,33 @@ jobs:
           rm -f sdk.tar.zst
           echo "::endgroup::"
 
+      - name: 配置 apk 签名
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APK_SIGNING_KEY:-}" ]; then
+            echo "::error::缺少 APK_SIGNING_KEY secret，无法签名"
+            exit 1
+          fi
+          # 私钥只写到 SDK 根目录，供 package-pack.mk 使用
+          printf '%s\n' "$APK_SIGNING_KEY" > sdk/private-key.pem
+          chmod 600 sdk/private-key.pem
+          cp keys/drcom.pem sdk/public-key.pem
+          # ImmortalWrt 25.12 SDK 的 package-pack.mk 默认不签单个 apk，这里补上 --sign
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('sdk/include/package-pack.mk')
+          s = p.read_text(encoding='utf-8')
+          if '--sign' not in s:
+              needle = '\t  --output "$$(PACK_$(1))"'
+              if needle not in s:
+                  raise SystemExit('package-pack.mk: --output line not found')
+              s = s.replace(needle, needle + ' \\\n\t  $$(if $$(wildcard $$(BUILD_KEY_APK_SEC)),--sign "$$(BUILD_KEY_APK_SEC)",)')
+              p.write_text(s, encoding='utf-8')
+          PY
+          grep -n -- '--sign' sdk/include/package-pack.mk
+
       - name: 编译
         run: |
           set -euo pipefail
@@ -100,6 +127,17 @@ jobs:
           find sdk/bin/packages -name 'luci-app-drcom-*.apk' -type f -print
           test -n "$(find sdk/bin/packages -name 'luci-app-drcom-*.apk' -type f -print -quit)"
 
+      - name: 验证 apk 签名
+        run: |
+          set -euo pipefail
+          # 用发布公钥校验产物确实被签名；未签名或签错会让这里失败
+          apk="$(find sdk/bin/packages -name 'luci-app-drcom-*.apk' -type f -print -quit)"
+          test -n "$apk"
+          mkdir -p /tmp/apk-keys
+          cp keys/drcom.pem /tmp/apk-keys/
+          LD_LIBRARY_PATH="$PWD/sdk/staging_dir/host/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            sdk/staging_dir/host/bin/apk --keys-dir /tmp/apk-keys verify "$apk"
+
       - name: 打包 tar.gz 安装包
         run: |
           set -euo pipefail
@@ -110,9 +148,10 @@ jobs:
       - name: 准备发布文件
         run: |
           set -euo pipefail
-          # 每个 Release 只挂 2 个文件，文件名带版本号（与 v1.0.0 / v1.0.1 保持一致）：
+          # Release 挂 3 个文件：apk、tar.gz、公钥
           #   luci-app-drcom-<版本>-r1.apk
           #   luci-app-drcom-<版本>.tar.gz
+          #   drcom.pem
           apk="$(find sdk/bin/packages -name 'luci-app-drcom-*.apk' -type f -print -quit)"
           tarball="$(find dist -maxdepth 1 -name '*.tar.gz' -type f -print -quit)"
           test -n "$apk"
@@ -120,6 +159,7 @@ jobs:
           mkdir -p release
           cp "$apk" "release/$(basename "$apk")"
           cp "$tarball" "release/$(basename "$tarball")"
+          cp keys/drcom.pem release/drcom.pem
           ls -lh release
 
       - name: 上传构建产物

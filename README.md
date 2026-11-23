@@ -69,42 +69,57 @@
 
 ## 安装
 
-> **apk 包说明**：当前 Release 里的 apk 是自行构建、**未签名**的 apk v3 包，apk 会强制验签，所以：
+> **apk 包说明**：Release 里的 apk 已用本项目自己的 EC P-256 密钥签名，公钥 `drcom.pem` 随 Release 发布。
+> 路由器需要先「认识」这把公钥（一次性），之后命令行安装和 LuCI 上传都不再需要 `--allow-untrusted`：
 >
-> - 命令行安装**必须**加 `--allow-untrusted`；
-> - 不能直接扔进 LuCI「软件包 → 上传包」安装——那里执行的是 `apk add /tmp/upload.apk`，不带该参数，会报 `UNTRUSTED signature`。
->
-> 想让 LuCI 网页直接上传安装，需要给包签名并把公钥放进路由器 `/etc/apk/keys/`（当前 Release 尚未提供签名包）。
+> - 已加公钥：`apk add ./xxx.apk` 直接装，LuCI「软件包 → 上传包」也能直接装；
+> - 未加公钥：仍可用 `apk add --allow-untrusted ./xxx.apk` 兜底。
+
+### 先加一次公钥（只做一次）
+
+在路由器上执行：
+
+```sh
+wget -O /etc/apk/keys/drcom.pem https://github.com/ht65/luci-app-drcom/releases/download/v1.0.15/drcom.pem
+echo '/etc/apk/keys/drcom.pem' >> /etc/sysupgrade.conf   # 固件升级后仍保留
+```
+
+> 公钥是公开的「验章样本」，不是密码；私钥不会发布、也不会随包分发。
+> 暂时不想加公钥也没关系，下面安装时保留 `--allow-untrusted` 即可。
 
 ### 方式一：安装 apk（推荐，能用 `apk del` 卸载）
 
-到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-<版本>-r1.apk`（当前为 `luci-app-drcom-1.0.14-r1.apk`）。
+到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-<版本>-r1.apk`（当前为 `luci-app-drcom-1.0.15-r1.apk`）。
 
 在电脑上下载后传到路由器（ImmortalWrt 的 SSH 没有 sftp-server，`scp` 要加 `-O`）：
 
 ```powershell
-scp -O .\luci-app-drcom-1.0.14-r1.apk root@192.168.1.1:/tmp/
+scp -O .\luci-app-drcom-1.0.15-r1.apk root@192.168.1.1:/tmp/
 ```
 
-在路由器上安装：
+在路由器上安装（已加公钥时不用 `--allow-untrusted`）：
 
 ```sh
-apk add --allow-untrusted /tmp/luci-app-drcom-1.0.14-r1.apk
+apk add /tmp/luci-app-drcom-1.0.15-r1.apk
+# 如果还没加公钥，改成：
+# apk add --allow-untrusted /tmp/luci-app-drcom-1.0.15-r1.apk
 
-# 验证
+# 可选：验证签名（OK 表示公钥已就位）
+apk verify /tmp/luci-app-drcom-1.0.15-r1.apk
+
 apk list -I | grep -i drcom
 ubus call drcom status
 
-rm -f /tmp/luci-app-drcom-1.0.14-r1.apk
+rm -f /tmp/luci-app-drcom-1.0.15-r1.apk
 ```
 
-升级时重复执行 `apk add --allow-untrusted ...` 即可；已存在的 `/etc/config/drcom` 不会被覆盖。
+升级时重复执行 `apk add ...` 即可；已存在的 `/etc/config/drcom` 不会被覆盖。
 
 ### 方式二：解压 tar.gz 执行 install.sh
 
 ```sh
 cd /tmp
-wget -O drcom.tar.gz https://github.com/ht65/luci-app-drcom/releases/download/v1.0.14/luci-app-drcom-1.0.14.tar.gz
+wget -O drcom.tar.gz https://github.com/ht65/luci-app-drcom/releases/download/v1.0.15/luci-app-drcom-1.0.15.tar.gz
 tar -xzf drcom.tar.gz
 cd luci-app-drcom
 sh install.sh
@@ -158,7 +173,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z: 一句话概括"
 git push origin vX.Y.Z
 ```
 
-CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并把 `CHANGELOG.md` 里对应版本的段落作为 Release 说明；找不到该段落会让构建直接失败。Release 挂带版本号的 `.apk` 和 `.tar.gz` 两个文件。
+CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并用 `APK_SIGNING_KEY`（GitHub Actions Secret）给 apk 签名、用 `apk verify` 校验；签名缺失或校验失败会让构建直接失败。Release 说明取自 `CHANGELOG.md` 对应段落。Release 挂带版本号的 `.apk`、`.tar.gz` 和公钥 `drcom.pem` 三个文件。
 
 ## 已知限制
 
@@ -173,7 +188,7 @@ CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并把 `CHANGELOG.md` 里对应�
 7. **设备列表约几秒刷新一次**（后台定时探测并写缓存，界面读缓存），所以插拔网线后几秒内就能看到变化，打开页面也不用等探测。
 8. **依赖几个系统组件**：`conntrack`（切断旧连接）、`iw`（识别无线设备）、`nftables`（设备阻断）、内核 nft **bridge 家族支持**、`jsonfilter`。缺 bridge 支持时界面会明确提示「阻断不可用」并写日志；缺 `iw` 时所有设备按「有线」显示。
 9. **登录密码在进程命令行里的可见性**：认证 URL 本身带明文密码。插件会优先用「从文件读 URL」的客户端避开这一点——GNU wget 的 `-i`，或 `curl -K` 配置文件；两者都没有时（默认的 BusyBox wget / uclient-fetch 就没有 `-i`）只能退回把 URL 直接交给 wget，此时密码会出现在 `ps` / `/proc/<pid>/cmdline` 里，插件会写一次性日志提示。介意的话执行 `apk add curl` 即可。
-10. **apk 包未签名**：当前 Release 的 apk 是自建、未签名的 v3 包，命令行安装必须 `--allow-untrusted`，LuCI「软件包」页上传会报 `UNTRUSTED signature`。这是 apk 的强制验签机制，不是本项目能绕过的。
+10. **apk 需要先加公钥**：Release 的 apk 已用本项目密钥签名，公钥 `drcom.pem` 随 Release 发布。把公钥放进 `/etc/apk/keys/`（一次）后，`apk add` 与 LuCI 上传都能直接安装；未加公钥时仍可用 `--allow-untrusted` 兜底。公钥建议写入 `/etc/sysupgrade.conf`，避免固件升级后丢失。
 11. **只适配 ImmortalWrt 25.12+（apk）**：OpenWrt 上游、opkg/ipk（ImmortalWrt 24.10 及更早）不在支持范围内；旧版系统请自行改 Makefile/安装方式，不保证可用。
 
 ## 命令行

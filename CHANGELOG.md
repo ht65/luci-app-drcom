@@ -4,6 +4,26 @@
 
 ---
 
+## v1.0.15 — 2026-11-23
+
+### 新增
+
+- **apk 单包签名**：CI 使用自建 EC P-256 密钥为每个 Release 的 apk 签名，并把公钥 `drcom.pem` 随 Release 一起发布。用户在路由器上把公钥放进 `/etc/apk/keys/`（一次）后：
+  - `apk add ./luci-app-drcom-<版本>-r1.apk` 不再需要 `--allow-untrusted`；
+  - LuCI「系统 → 软件 → 上传包」可以直接安装（此前会报 `UNTRUSTED signature`）。
+- 构建流程增加签名校验（`apk verify --keys-dir`），签名失败或未签名会直接让 CI 失败。
+
+### 变更
+
+- **适配范围收敛为 ImmortalWrt 25.12+（apk）**：不再适配 OpenWrt 上游与 opkg/ipk（含 ImmortalWrt 24.10 及更早），README 按此重写。
+
+### 说明
+
+- 签名密钥固定，公钥只需加一次；建议把公钥路径写入 `/etc/sysupgrade.conf`，避免固件升级后丢失。
+- 未加公钥时仍可用 `apk add --allow-untrusted` 兜底安装。
+
+---
+
 ## v1.0.14 — 2026-11-23
 
 > 本次为代码审查后的修复，已在 Cudy TR3000 v1 / ImmortalWrt 25.12.2 实机验证（安装、状态、设备列表、断开/解除、总开关、上下线、卸载脚本共 20 项全部通过）。
