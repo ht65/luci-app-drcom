@@ -135,8 +135,8 @@ jobs:
           test -n "$apk"
           mkdir -p /tmp/apk-keys
           cp keys/drcom.pem /tmp/apk-keys/
-          LD_LIBRARY_PATH="$PWD/sdk/staging_dir/host/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-            sdk/staging_dir/host/bin/apk --keys-dir /tmp/apk-keys verify "$apk"
+          # 不要覆盖 runner 的 LD_LIBRARY_PATH，否则会加载 SDK 里的 glibc 导致命令起不来
+          sdk/staging_dir/host/bin/apk --keys-dir /tmp/apk-keys verify "$apk"
 
       - name: 打包 tar.gz 安装包
         run: |
