@@ -1,7 +1,7 @@
 #
 # luci-app-drcom —— Dr.COM 校园网 Portal 认证
 #
-# 不依赖 luci feed，可直接在 OpenWrt / ImmortalWrt SDK 中编译：
+# 仅适配 ImmortalWrt 25.12+（apk），可在 ImmortalWrt SDK 中直接编译：
 #
 #   cp -r luci-app-drcom <sdk>/package/
 #   cd <sdk>

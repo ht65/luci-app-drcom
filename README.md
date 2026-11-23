@@ -1,30 +1,22 @@
 # luci-app-drcom
 
-给 OpenWrt / ImmortalWrt 用的 Dr.COM（城市热点）校园网网页认证插件，带 LuCI 图形界面。
-
-本项目基于 **重庆财经职业学院** 校园网实测开发，认证系统为 Dr.COM ePortal 4.x。本校同学直接用默认配置即可，其他学校需要修改认证门户地址。
+给 **ImmortalWrt 25.12 及以后（apk 包管理）** 用的 Dr.COM（城市热点）校园网网页认证插件，带 LuCI 图形界面。
 
 路由器代替电脑完成 Portal 认证，接在路由器后面的设备共享同一条已认证的校园网连接，不用每台设备各自登录。
 
-## 功能
+本项目基于 **重庆财经职业学院** 校园网实测开发，认证系统为 Dr.COM ePortal 4.x。本校同学直接用默认配置即可，其他学校需要修改认证门户地址。
 
-- 界面顶部有「插件总开关」：一键停用整个插件（不再探测/认证/动上行），改用 USB CPE 等其它上行时可避免冲突
-- 开机自动认证，断线自动重连（守护循环只看「现在能不能上网」，不看上次结果）
-- LuCI 页面：状态卡片、上线/下线/立即重新认证、实时日志、账号与参数配置
-- 界面可查看「当前连接设备」（只列在线与已阻断的设备，断开的会自动消失）：设备名称、IP、MAC、有线 / WiFi，并支持一键断开某台设备（立即切断 + 持续阻断，直到手动解除）
-- 实时日志分「自动认证」和「手动操作」两类，可切换查看
-- 认证失败按指数退避重试；连续失败过多会暂停自动重试并提示原因，避免把账号撞到风控
-- 最近一次失败原因直接显示在界面上，不用去翻日志
-- 「下线路由器」只断开本机上行，不影响同账号的手机等其他设备，且暂停状态跨重启保留
-- 账号密码只存在路由器本地 `/etc/config/drcom`（权限 600）
-- 上行重新拨起时只唤醒守护进程，不再整体重启服务
+> **适配范围：只适配 ImmortalWrt 25.12+（apk-tools 3）。**
+> 不再支持 OpenWrt 上游、opkg/ipk 包管理（含 ImmortalWrt 24.10 及更早）。
 
-## 适合什么环境
+## 适配范围与测试环境
 
-### 开发环境
+- 固件：**ImmortalWrt 25.12.2**（aarch64），Cudy TR3000 v1（mediatek/filogic）
+- 包管理：**apk-tools 3**（`.apk` v3 格式）
+- 接入方式：无线中继 `wwan` 作为上行
+- 校园网：Dr.COM ePortal 4.x，认证页 `http://login.cqcfe.com/a79.htm`，认证服务器 `172.22.44.46:801`
 
-- 校园网：重庆财经职业学院，Dr.COM（城市热点）ePortal 4.x，认证页 `http://login.cqcfe.com/a79.htm`，认证服务器 `172.22.44.46:801`
-- 固件：ImmortalWrt 25.12.2（aarch64），以无线中继方式接入校园网
+已在上述设备上完成实机验证：安装、在线状态、设备列表、断开/解除、总开关、上下线、卸载脚本、apk 升级等 20 项全部通过。
 
 ### 通用判断标准
 
@@ -32,19 +24,83 @@
 
 - 登录：`GET http://<服务器>:801/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,<账号>&user_password=<密码>&...`
 - 在线列表：`GET http://<服务器>:801/eportal/portal/online_list?callback=dr1003&user_account=<账号>`
-- 判定成功：返回 `"result":1`，同时用真实连通性探测复核（见下）
+- 判定成功：返回 `"result":1`，同时用真实连通性探测复核
 
-成功与否不看接口返回值本身，而是抓 `http://www.msftconnecttest.com/connecttest.txt` 是否等于 `Microsoft Connect Test`。未认证时这个请求会被劫持到认证页，所以区分得很干净。
+成功与否不只看接口返回值，还要抓 `http://www.msftconnecttest.com/connecttest.txt` 是否等于 `Microsoft Connect Test`（这两个地址都可以在界面里改）。未认证时这个请求会被劫持到认证页，所以区分得很干净。
+
+## 功能
+
+### 认证与重连
+
+- 开机自动认证，断线自动重连（守护循环只看「现在能不能上网」，不看上次结果）
+- 认证失败按指数退避重试；连续失败达到上限会自动暂停并显示原因，避免账号被风控
+- 「立即重新认证」只重新认证一次，不重拨接口，已在线时不会重复登录
+- 「下线路由器」只断开本机上行，不影响同账号的手机等其他设备；暂停状态写在 `/etc/drcom.paused`，跨重启保留
+- 上行重新拨起（`ifup`）时只唤醒守护进程，不整体重启服务
+- 双上行（`wwan` + `wan` 都有 IP）时，按当前默认路由的源地址填 `wlan_user_ip`，避免 ePortal 报「IP 不一致」
+- 连通性检测的 URL 和期望内容可在界面配置，换学校/门户劫持方式不同也能适配
+
+### 设备管理
+
+- 「当前连接设备」列表：设备名称、IP、MAC、有线 / WiFi；只列在线与已阻断的设备，断开的会自动消失
+- 后台每几秒探测一次并写缓存，界面直接读缓存，插拔网线几秒内可见，打开页面不用等探测
+- 「断开」某台设备：清掉 conntrack（已建立连接立即失效，硬件转发开着也有效）+ 用 nft 阻断它的单播帧
+- 阻断**一直持续到点「解除」或关闭插件总开关**；名单存在 `/etc/drcom.blocked`，重启后仍生效
+- 阻断/解除会校验 nft 是否真的下发成功，失败会明确报错，不谎报
+
+### 安全与稳定性
+
+- 登录密码尽量不进入进程命令行：优先用 GNU wget 的 `-i` 或 `curl -K <0600 配置文件>`；两者都不可用时退回 BusyBox wget 并写一次性日志提示
+- 账号密码只存在路由器本地 `/etc/config/drcom`（权限 600）；状态目录 700；日志临时文件也放在该目录
+- 状态文件、登录响应、日志临时文件均按 PID 命名，避免并发互相覆盖
+- procd 停机超时放宽到 20 秒，停止/重启时守护能正常退出并刷新状态，不残留 `watch.pid`
+- 卸载（`apk del` 或 `uninstall.sh`）会清理内核里的 nft 阻断表与 `/etc` 下的运行时状态，不留「被断设备一直黑洞」的残留
+- 设备存活判定优先读 pidfile 并核对 `/proc/<pid>/cmdline`，避免 PID 复用误唤醒无关进程
+- 界面轮询会注销旧回调、设备列表内容不变时不重建 DOM，避免 LuCI 页面越用越卡
+
+### 界面
+
+- 插件总开关：一键停用整个插件（不再探测、认证、动上行），改用 USB CPE 等其它上行时可避免冲突
+- 状态卡片：运行状态、上行接口、本机 IP、认证账号、终端类型、认证服务器、状态更新时间、最近错误
+- 手动操作：上线、立即重新认证、下线路由器、重启服务
+- 实时日志分「自动认证」和「手动操作」两类，可切换查看
+- 最近一次失败原因与连续失败次数直接显示在界面上
+- 状态读取失败时会禁用总开关按钮，避免误操作
 
 ## 安装
 
-> **注意：发布包是 `.tar.gz`，不是 `.apk`。**
-> 它不能扔进 LuCI 的「软件包」页面安装——那样会报 `UNTRUSTED signature` 或 `unexpected end of file`。
-> 正确的用法是解压后执行 `install.sh`（方式一）。
+> **apk 包说明**：当前 Release 里的 apk 是自行构建、**未签名**的 apk v3 包，apk 会强制验签，所以：
+>
+> - 命令行安装**必须**加 `--allow-untrusted`；
+> - 不能直接扔进 LuCI「软件包 → 上传包」安装——那里执行的是 `apk add /tmp/upload.apk`，不带该参数，会报 `UNTRUSTED signature`。
+>
+> 想让 LuCI 网页直接上传安装，需要给包签名并把公钥放进路由器 `/etc/apk/keys/`（当前 Release 尚未提供签名包）。
 
-### 方式一：直接安装（推荐，不需要编译）
+### 方式一：安装 apk（推荐，能用 `apk del` 卸载）
 
-在路由器上执行：
+到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-<版本>-r1.apk`（当前为 `luci-app-drcom-1.0.14-r1.apk`）。
+
+在电脑上下载后传到路由器（ImmortalWrt 的 SSH 没有 sftp-server，`scp` 要加 `-O`）：
+
+```powershell
+scp -O .\luci-app-drcom-1.0.14-r1.apk root@192.168.1.1:/tmp/
+```
+
+在路由器上安装：
+
+```sh
+apk add --allow-untrusted /tmp/luci-app-drcom-1.0.14-r1.apk
+
+# 验证
+apk list -I | grep -i drcom
+ubus call drcom status
+
+rm -f /tmp/luci-app-drcom-1.0.14-r1.apk
+```
+
+升级时重复执行 `apk add --allow-untrusted ...` 即可；已存在的 `/etc/config/drcom` 不会被覆盖。
+
+### 方式二：解压 tar.gz 执行 install.sh
 
 ```sh
 cd /tmp
@@ -54,37 +110,13 @@ cd luci-app-drcom
 sh install.sh
 ```
 
-> 每个 Release 挂两个文件，文件名带版本号：`luci-app-drcom-<版本>.tar.gz` 和 `luci-app-drcom-<版本>-r1.apk`。
-> 上面链接里的版本号是本文档更新时的最新版，下载前请到 [Releases](https://github.com/ht65/luci-app-drcom/releases)
-> 确认实际版本（apk 同理）。
+也可以从电脑下载后 `scp -O` 传上去再解压。两种安装方式都保留 `/etc/config/drcom`。
 
-装完打开 LuCI：**服务 → Dr.COM 认证**，填账号密码，保存。
+### 方式三：自己用 ImmortalWrt SDK 编译
 
-已存在的 `/etc/config/drcom` 不会被覆盖，升级不会丢账号。
-
-### 方式二：安装 apk（推荐给想用包管理器的）
-
-ImmortalWrt 25.12 起包管理器换成了 apk-tools 3，安装包是带签名的 v3 格式（二进制 ADB 容器），只能在 Linux 环境用 SDK 编译产出，手工打包不可行。
-
-本仓库配置了 GitHub Actions，每次推送 `v*` 标签会自动用 ImmortalWrt 25.12.2 SDK 编译出 apk 并附加到 Release。到 [Releases](https://github.com/ht65/luci-app-drcom/releases) 下载 `luci-app-drcom-<版本>-r1.apk`（当前为 `luci-app-drcom-1.0.14-r1.apk`），然后在路由器上：
+需要一台 Linux 机器（或 WSL / Docker），使用与固件同版本的 **ImmortalWrt 25.12.x SDK**：
 
 ```sh
-apk add --allow-untrusted ./luci-app-drcom-1.0.14-r1.apk
-```
-
-用 apk 安装的好处是：它会正常出现在 LuCI 的「软件包」列表里，也能用 `apk del luci-app-drcom` 卸载。
-
-注意两点：
-
-- 自行构建的包没有官方密钥签名，**必须**加 `--allow-untrusted`。
-- LuCI「软件包」页面上传安装时执行的是 `apk add /tmp/upload.apk`，**不带**这个参数，所以在那里会报 `UNTRUSTED signature`。请用命令行安装，或先把签名公钥放进 `/etc/apk/keys/`。
-
-### 方式三：自己用 SDK 编译
-
-需要一台 Linux 机器（或 WSL / Docker）：
-
-```sh
-# 下载与固件同版本的 SDK，解压后把本仓库放进 package/
 cp -r luci-app-drcom <sdk>/package/
 cd <sdk>
 make defconfig
@@ -92,7 +124,11 @@ make package/luci-app-drcom/compile V=s
 # 产物：bin/packages/*/base/luci-app-drcom-*.apk
 ```
 
-`Makefile` 不依赖 luci feed，只依赖 `rpcd`，包架构为 `all`。
+`Makefile` 不依赖 luci feed，只依赖 `rpcd` 等基础包，包架构为 `all`（noarch）。
+
+### 装完
+
+打开 LuCI：**服务 → Dr.COM 认证**，填账号密码，保存。改完点「保存并应用」，在下一轮在线检测时生效；要立刻生效点「重启服务」。
 
 ## 配置项
 
@@ -100,17 +136,17 @@ LuCI 页面里都能改，也可以直接改 `/etc/config/drcom`：
 
 | 选项 | 说明 |
 | --- | --- |
+| `enabled` | 插件总开关：`1` 启用 / `0` 停用（停用后不探测、不认证、不动上行） |
 | `username` / `password` | 校园网账号密码 |
 | `carrier` | 运营商后缀：校园移动/校园用户留空，电信 `@dx`，联通 `@lt` |
-| `terminal_type` | 上报的终端类型：`1`PC（默认） `2`手机 |
+| `terminal_type` | 上报的终端类型：`1` PC（默认） `2` 手机 |
 | `uplink` | 上行接口，`auto` 自动在无线中继 `wwan` 和有线 `wan` 之间选已获取 IP 的那个 |
 | `portal_host` / `portal_ip` / `portal_port` | 认证门户，默认值为重庆财经职业学院的 `login.cqcfe.com` / `172.22.44.46:801`，**换学校必须改** |
+| `probe_url` / `probe_expect` | 连通性检测地址与期望内容，默认 `http://www.msftconnecttest.com/connecttest.txt` / `Microsoft Connect Test` |
 | `check_interval` | 在线检测间隔（秒），越大越省流量，越小掉线恢复越快 |
 | `retry_interval` | 首次重试间隔（秒）；连续失败时按指数退避逐次拉长 |
 | `retry_max_interval` | 退避上限（秒），默认 `300` |
 | `fail_max` | 连续失败达到该次数后暂停自动重试，默认 `5`，避免账号被风控 |
-
-改完点「保存并应用」，最多 60 秒自动生效；要立刻生效点「重启服务」。
 
 ## 发版流程
 
@@ -122,8 +158,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z: 一句话概括"
 git push origin vX.Y.Z
 ```
 
-CI 会把 `CHANGELOG.md` 里对应版本的段落**作为 Release 说明**发出去；找不到该段落会让构建直接失败，
-所以不存在「发了版却没有改动说明」的情况。Release 只挂两个带版本号的文件。
+CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并把 `CHANGELOG.md` 里对应版本的段落作为 Release 说明；找不到该段落会让构建直接失败。Release 挂带版本号的 `.apk` 和 `.tar.gz` 两个文件。
 
 ## 已知限制
 
@@ -135,9 +170,11 @@ CI 会把 `CHANGELOG.md` 里对应版本的段落**作为 Release 说明**发出
 4. **「下线路由器」会连带断开路由器后面的设备上网**，这是「下线」的应有之义；WiFi 本身不断，随时可以回页面点上线。暂停标记存在 `/etc/drcom.paused`，重启路由器后仍保持暂停，需要点「上线」才会恢复。
 5. **连续失败会自动暂停重试。** 达到 `fail_max`（默认 5）次后守护不再自动登录，界面会显示最近一次失败原因。改好账号 / 密码 / 运营商后缀后点「立即重新认证」即可恢复；如果网络自己恢复了（例如无感知认证重新生效），守护也会自动解除暂停。
 6. **「断开」某台设备靠两个动作**：清掉它的 conntrack（已建立的连接立刻失效，硬件转发开着也一样）+ 用 nft 阻断它的单播帧。阻断**一直持续到你点「解除」或关闭插件总开关**（关插件会解除全部阻断）；名单存在 `/etc/drcom.blocked`，重启路由器后仍生效。依赖 `conntrack` 小工具（apk 安装会自动带上；用 `install.sh` 手动装需要自己 `apk add conntrack`，否则旧连接不会立刻断）。
-7. **设备列表约 6 秒刷新一次**（后台定时探测并写缓存，界面读缓存），所以插拔网线后几秒内就能看到变化，打开页面也不用等探测。
-8. **依赖几个系统组件**：`conntrack`（切断旧连接，apk 安装会自动带上）、`iw`（识别无线设备）、以及内核的 nft **bridge 家族支持**（设备阻断）。若固件缺 bridge 支持，界面会明确提示「阻断不可用」并写日志，不会静默失败；缺 `iw` 时所有设备会按「有线」显示。
-9. **登录密码在进程命令行里的可见性**：认证 URL 本身带明文密码。插件会优先用「从文件读 URL」的客户端避开这一点——GNU wget 的 `-i`，或 `curl` 的 `-K` 配置文件；两者都没有时（ImmortalWrt 默认的 BusyBox wget / uclient-fetch 就没有 `-i`）只能退回把 URL 直接交给 wget，此时密码会出现在 `ps` / `/proc/<pid>/cmdline` 里，插件会在日志里提示一次。介意的话在路由器上装一个 `curl` 即可：`apk add curl`。
+7. **设备列表约几秒刷新一次**（后台定时探测并写缓存，界面读缓存），所以插拔网线后几秒内就能看到变化，打开页面也不用等探测。
+8. **依赖几个系统组件**：`conntrack`（切断旧连接）、`iw`（识别无线设备）、`nftables`（设备阻断）、内核 nft **bridge 家族支持**、`jsonfilter`。缺 bridge 支持时界面会明确提示「阻断不可用」并写日志；缺 `iw` 时所有设备按「有线」显示。
+9. **登录密码在进程命令行里的可见性**：认证 URL 本身带明文密码。插件会优先用「从文件读 URL」的客户端避开这一点——GNU wget 的 `-i`，或 `curl -K` 配置文件；两者都没有时（默认的 BusyBox wget / uclient-fetch 就没有 `-i`）只能退回把 URL 直接交给 wget，此时密码会出现在 `ps` / `/proc/<pid>/cmdline` 里，插件会写一次性日志提示。介意的话执行 `apk add curl` 即可。
+10. **apk 包未签名**：当前 Release 的 apk 是自建、未签名的 v3 包，命令行安装必须 `--allow-untrusted`，LuCI「软件包」页上传会报 `UNTRUSTED signature`。这是 apk 的强制验签机制，不是本项目能绕过的。
+11. **只适配 ImmortalWrt 25.12+（apk）**：OpenWrt 上游、opkg/ipk（ImmortalWrt 24.10 及更早）不在支持范围内；旧版系统请自行改 Makefile/安装方式，不保证可用。
 
 ## 命令行
 
@@ -146,10 +183,19 @@ CI 会把 `CHANGELOG.md` 里对应版本的段落**作为 Release 说明**发出
 /usr/sbin/drcom-portal login     # 立即重新认证（已在线时不会重复登录）
 /usr/sbin/drcom-portal online    # 拉起上行并解除暂停
 /usr/sbin/drcom-portal offline   # 断开上行并暂停自动认证
-logread | grep drcom             # 看日志
+logread -e drcom | tail -n 30    # 看日志
 ```
 
 ## 卸载
+
+用 apk 安装的：
+
+```sh
+apk del luci-app-drcom        # 删除程序（保留 /etc/config/drcom）
+rm -f /etc/config/drcom       # 想连配置一起删再加这句
+```
+
+用 `install.sh` 安装的：
 
 ```sh
 cd /tmp/luci-app-drcom
@@ -157,12 +203,14 @@ sh uninstall.sh           # 保留 /etc/config/drcom
 sh uninstall.sh --purge   # 连配置一起删
 ```
 
+两种方式都会清理 `/etc/drcom.paused`、`/etc/drcom.blocked`、`/var/run/drcom` 和内核里的 `nft` 阻断表。
+
 ## 文件说明
 
 ```
 root/etc/init.d/drcom                         procd 服务，开机自启
-root/etc/hotplug.d/iface/95-drcom             上行 ifup 时重新认证
-root/usr/sbin/drcom-portal                    认证客户端
+root/etc/hotplug.d/iface/95-drcom             上行 ifup 时唤醒守护
+root/usr/sbin/drcom-portal                    认证客户端（守护 / 手动命令）
 root/usr/libexec/rpcd/drcom                   LuCI 后端（ubus 接口）
 root/usr/share/luci/menu.d/                   菜单注册
 root/usr/share/rpcd/acl.d/                    权限声明
