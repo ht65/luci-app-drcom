@@ -8,15 +8,109 @@
 
 > **适配范围：只适配 ImmortalWrt 25.12+（apk-tools 3）。**
 > 不再支持 OpenWrt 上游、opkg/ipk 包管理（含 ImmortalWrt 24.10 及更早）。
+>
+> **签名策略：从 v1.0.15 起，每个 Release 的 apk 都用本项目密钥签名，公钥 `drcom.pem` 随 Release 发布。**
+> **第一次安装**需要把公钥加到路由器一次（见下方「签名与公钥」）；**以后升级**不需要再加，直接安装即可。
+
+## 签名与公钥（第一次安装必读）
+
+### 为什么需要
+
+apk 会强制校验包签名：没有签名、或公钥不被路由器认识的包，会被拒绝并报 `UNTRUSTED signature`——命令行 `apk add` 和 LuCI「软件包 → 上传包」都一样。  
+给包签名、并让路由器认识对应公钥之后，安装就变成普通的软件包安装：
+
+- 命令行：`apk add ./luci-app-drcom-x.y.z-r1.apk`，**不需要** `--allow-untrusted`
+- LuCI：**系统 → 软件 → 上传包**，选 apk 直接装（以前这里会报 UNTRUSTED）
+
+### 公钥和私钥是什么
+
+- **公钥**（`drcom.pem`）：公开的「验章样本」，随 Release 发布。放一份在路由器的 `/etc/apk/keys/` 里，路由器就能验证本项目签的包。
+- **私钥**：只在发布者手里（存放在 GitHub Actions Secret），不会发布、也不会随包分发。
+- 所有后续版本都用**同一把密钥签名**，所以公钥**只需加一次**；只有换密钥时才需要重新加。
+
+### 第一次安装：加一次公钥
+
+下面两种方式任选一种，只需做一次。
+
+**方法 A：路由器能访问 GitHub（推荐）**
+
+SSH 登录路由器执行：
+
+```sh
+mkdir -p /etc/apk/keys
+wget -O /etc/apk/keys/drcom.pem \
+  https://github.com/ht65/luci-app-drcom/releases/latest/download/drcom.pem
+chmod 644 /etc/apk/keys/drcom.pem
+
+# 固件升级后仍保留这把公钥
+echo '/etc/apk/keys/drcom.pem' >> /etc/sysupgrade.conf
+```
+
+**方法 B：电脑上下载，再传到路由器**
+
+若路由器访问 GitHub 不方便（校园网常见），在电脑上操作：
+
+```powershell
+# 1) 电脑上下载公钥（走系统代理也可以加：-x http://127.0.0.1:7890）
+curl.exe -L -o drcom.pem `
+  https://github.com/ht65/luci-app-drcom/releases/latest/download/drcom.pem
+
+# 2) 传到路由器（ImmortalWrt 的 SSH 没有 sftp-server，scp 必须加 -O）
+scp -O .\drcom.pem root@192.168.1.1:/tmp/
+```
+
+然后 SSH 登录路由器：
+
+```sh
+mkdir -p /etc/apk/keys
+cp /tmp/drcom.pem /etc/apk/keys/drcom.pem
+chmod 644 /etc/apk/keys/drcom.pem
+rm -f /tmp/drcom.pem
+echo '/etc/apk/keys/drcom.pem' >> /etc/sysupgrade.conf
+```
+
+**验证公钥是否生效**
+
+下载任意一个已签名的 apk（例如当前最新版），执行：
+
+```sh
+apk verify /tmp/luci-app-drcom-1.0.15-r1.apk
+# 期望输出：/tmp/luci-app-drcom-1.0.15-r1.apk: OK
+```
+
+输出 `OK` 说明公钥已就位；输出 `UNTRUSTED signature` 说明公钥没放对，检查 `/etc/apk/keys/`。
+
+> 公钥是公开的「验章样本」，不是密码，可以随便转发；私钥才是要保密的东西。
+
+### 以后升级
+
+公钥加过一次之后，**以后每个版本都不用再操作**：
+
+```sh
+apk add /tmp/luci-app-drcom-<新版本>-r1.apk
+```
+
+或者直接在 LuCI：**系统 → 软件 → 上传包**，选新版本 apk 安装。  
+已存在的 `/etc/config/drcom` 不会被覆盖。
+
+### 如果暂时不想加公钥
+
+仍可以用 `--allow-untrusted` 兜底安装：
+
+```sh
+apk add --allow-untrusted /tmp/luci-app-drcom-<版本>-r1.apk
+```
+
+但这种方式下 **LuCI 网页上传仍然装不了**（它内部执行 `apk add`，不带这个参数）。所以建议还是加上公钥。
 
 ## 适配范围与测试环境
 
 - 固件：**ImmortalWrt 25.12.2**（aarch64），Cudy TR3000 v1（mediatek/filogic）
-- 包管理：**apk-tools 3**（`.apk` v3 格式）
+- 包管理：**apk-tools 3**（`.apk` v3 格式，带签名）
 - 接入方式：无线中继 `wwan` 作为上行
 - 校园网：Dr.COM ePortal 4.x，认证页 `http://login.cqcfe.com/a79.htm`，认证服务器 `172.22.44.46:801`
 
-已在上述设备上完成实机验证：安装、在线状态、设备列表、断开/解除、总开关、上下线、卸载脚本、apk 升级等 20 项全部通过。
+已在上述设备上完成实机验证：安装/升级、签名校验、在线状态、设备列表、断开/解除、总开关、上下线、卸载脚本等全部通过。
 
 ### 通用判断标准
 
@@ -57,6 +151,7 @@
 - 卸载（`apk del` 或 `uninstall.sh`）会清理内核里的 nft 阻断表与 `/etc` 下的运行时状态，不留「被断设备一直黑洞」的残留
 - 设备存活判定优先读 pidfile 并核对 `/proc/<pid>/cmdline`，避免 PID 复用误唤醒无关进程
 - 界面轮询会注销旧回调、设备列表内容不变时不重建 DOM，避免 LuCI 页面越用越卡
+- **包签名**：Release 的 apk 均由 CI 用固定密钥签名，构建阶段会用 `apk verify` 兜底校验，签名缺失/校验失败不会发版
 
 ### 界面
 
@@ -69,23 +164,7 @@
 
 ## 安装
 
-> **apk 包说明**：Release 里的 apk 已用本项目自己的 EC P-256 密钥签名，公钥 `drcom.pem` 随 Release 发布。
-> 路由器需要先「认识」这把公钥（一次性），之后命令行安装和 LuCI 上传都不再需要 `--allow-untrusted`：
->
-> - 已加公钥：`apk add ./xxx.apk` 直接装，LuCI「软件包 → 上传包」也能直接装；
-> - 未加公钥：仍可用 `apk add --allow-untrusted ./xxx.apk` 兜底。
-
-### 先加一次公钥（只做一次）
-
-在路由器上执行：
-
-```sh
-wget -O /etc/apk/keys/drcom.pem https://github.com/ht65/luci-app-drcom/releases/download/v1.0.15/drcom.pem
-echo '/etc/apk/keys/drcom.pem' >> /etc/sysupgrade.conf   # 固件升级后仍保留
-```
-
-> 公钥是公开的「验章样本」，不是密码；私钥不会发布、也不会随包分发。
-> 暂时不想加公钥也没关系，下面安装时保留 `--allow-untrusted` 即可。
+> 下面默认你已经按「签名与公钥」加过公钥；没加的请先加，或者在命令里保留 `--allow-untrusted`。
 
 ### 方式一：安装 apk（推荐，能用 `apk del` 卸载）
 
@@ -97,14 +176,12 @@ echo '/etc/apk/keys/drcom.pem' >> /etc/sysupgrade.conf   # 固件升级后仍保
 scp -O .\luci-app-drcom-1.0.15-r1.apk root@192.168.1.1:/tmp/
 ```
 
-在路由器上安装（已加公钥时不用 `--allow-untrusted`）：
+在路由器上安装：
 
 ```sh
 apk add /tmp/luci-app-drcom-1.0.15-r1.apk
-# 如果还没加公钥，改成：
-# apk add --allow-untrusted /tmp/luci-app-drcom-1.0.15-r1.apk
 
-# 可选：验证签名（OK 表示公钥已就位）
+# 想先验一下签名也可以：
 apk verify /tmp/luci-app-drcom-1.0.15-r1.apk
 
 apk list -I | grep -i drcom
@@ -113,7 +190,9 @@ ubus call drcom status
 rm -f /tmp/luci-app-drcom-1.0.15-r1.apk
 ```
 
-升级时重复执行 `apk add ...` 即可；已存在的 `/etc/config/drcom` 不会被覆盖。
+**或者用 LuCI 安装**（加过公钥后可用）：系统 → 软件 → 上传包 → 选择 `.apk` → 安装。
+
+升级时重复执行 `apk add ...` 或再上传一次即可；已存在的 `/etc/config/drcom` 不会被覆盖。
 
 ### 方式二：解压 tar.gz 执行 install.sh
 
@@ -173,7 +252,9 @@ git tag -a vX.Y.Z -m "vX.Y.Z: 一句话概括"
 git push origin vX.Y.Z
 ```
 
-CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并用 `APK_SIGNING_KEY`（GitHub Actions Secret）给 apk 签名、用 `apk verify` 校验；签名缺失或校验失败会让构建直接失败。Release 说明取自 `CHANGELOG.md` 对应段落。Release 挂带版本号的 `.apk`、`.tar.gz` 和公钥 `drcom.pem` 三个文件。
+CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并用 `APK_SIGNING_KEY`（GitHub Actions Secret）给 apk 签名、用 `apk verify` 校验；签名缺失或校验失败会让构建直接失败。
+
+**从 v1.0.15 起，每个 Release 都会签名，公钥固定不变**，所以用户加过一次公钥后不需要再重复操作。Release 说明取自 `CHANGELOG.md` 对应段落；Release 挂带版本号的 `.apk`、`.tar.gz` 和公钥 `drcom.pem` 三个文件。
 
 ## 已知限制
 
@@ -188,7 +269,7 @@ CI 使用 ImmortalWrt 25.12.2 SDK 编译 apk，并用 `APK_SIGNING_KEY`（GitHub
 7. **设备列表约几秒刷新一次**（后台定时探测并写缓存，界面读缓存），所以插拔网线后几秒内就能看到变化，打开页面也不用等探测。
 8. **依赖几个系统组件**：`conntrack`（切断旧连接）、`iw`（识别无线设备）、`nftables`（设备阻断）、内核 nft **bridge 家族支持**、`jsonfilter`。缺 bridge 支持时界面会明确提示「阻断不可用」并写日志；缺 `iw` 时所有设备按「有线」显示。
 9. **登录密码在进程命令行里的可见性**：认证 URL 本身带明文密码。插件会优先用「从文件读 URL」的客户端避开这一点——GNU wget 的 `-i`，或 `curl -K` 配置文件；两者都没有时（默认的 BusyBox wget / uclient-fetch 就没有 `-i`）只能退回把 URL 直接交给 wget，此时密码会出现在 `ps` / `/proc/<pid>/cmdline` 里，插件会写一次性日志提示。介意的话执行 `apk add curl` 即可。
-10. **apk 需要先加公钥**：Release 的 apk 已用本项目密钥签名，公钥 `drcom.pem` 随 Release 发布。把公钥放进 `/etc/apk/keys/`（一次）后，`apk add` 与 LuCI 上传都能直接安装；未加公钥时仍可用 `--allow-untrusted` 兜底。公钥建议写入 `/etc/sysupgrade.conf`，避免固件升级后丢失。
+10. **apk 需要先加公钥**：Release 的 apk 已用本项目密钥签名，公钥 `drcom.pem` 随 Release 发布。第一次安装要把公钥放进 `/etc/apk/keys/`（一次），之后 `apk add` 与 LuCI 上传都能直接安装；未加公钥时仍可用 `--allow-untrusted` 兜底（但 LuCI 上传不可用）。公钥建议写入 `/etc/sysupgrade.conf`，避免固件升级后丢失。
 11. **只适配 ImmortalWrt 25.12+（apk）**：OpenWrt 上游、opkg/ipk（ImmortalWrt 24.10 及更早）不在支持范围内；旧版系统请自行改 Makefile/安装方式，不保证可用。
 
 ## 命令行
@@ -231,6 +312,7 @@ root/usr/share/luci/menu.d/                   菜单注册
 root/usr/share/rpcd/acl.d/                    权限声明
 root/www/luci-static/resources/view/drcom/    前端页面
 root/usr/share/drcom/config.default           默认配置模板
+keys/drcom.pem                                签名公钥（发布用，可公开）
 ```
 
 ## 免责声明
