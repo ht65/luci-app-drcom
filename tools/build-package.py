@@ -6,6 +6,8 @@
     python3 tools/build-package.py
 """
 
+import gzip
+import io
 import os
 import sys
 import tarfile
@@ -77,9 +79,17 @@ def main():
     if VERSION == '0.0.0':
         sys.exit('错误：没能从 Makefile 读到 PKG_VERSION')
 
-    with tarfile.open(out, 'w:gz', format=tarfile.USTAR_FORMAT) as tar:
+    # 先写未压缩 tar 到内存，再用固定 mtime 的 gzip 压缩。
+    # 直接用 tarfile 的 'w:gz' 会让 gzip 头用当前时间，产物不可复现
+    # （SOURCE_DATE_EPOCH 只作用于 TarInfo.mtime，管不到 gzip 头）。
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w', format=tarfile.USTAR_FORMAT) as tar:
         for item in INCLUDE:
             add(item)
+
+    with open(out, 'wb') as f:
+        with gzip.GzipFile(filename='', mode='wb', fileobj=f, mtime=mtime) as gz:
+            gz.write(buf.getvalue())
 
     print('已生成: %s' % out)
     print('  大小: %.1f KB  文件数: %d' % (os.path.getsize(out) / 1024.0, count))

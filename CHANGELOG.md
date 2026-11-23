@@ -4,6 +4,37 @@
 
 ---
 
+## 未发布 — 2026-11-23
+
+> 本次为代码审查后的修复，尚未发版（`Makefile` 的 `PKG_VERSION` 保持 1.0.13，发版时再按流程提升版本号）。
+
+### 修复
+
+- **登录密码实际会进 `wget` 命令行**：之前「用 `wget -i` 从文件读 URL」的规避只在 GNU wget 下成立，而 ImmortalWrt 默认的 BusyBox wget / uclient-fetch 没有 `-i`，因此恒走「URL 直接放命令行」分支，密码在 `ps` / `/proc/<pid>/cmdline` 里可见。现在按可用客户端分三档：GNU wget `-i` → `curl -K <0600 配置文件>` → 都不可用时退回 BusyBox wget 并写一条一次性日志提示；临时文件改为按 PID 命名并立即删除。
+- **LuCI 轮询回调随每次打开页面累积**：`poll` 回调不会随视图切换自动注销，而旧实现每次 `render()` 都注册一个新闭包，反复进页面会累积成多条 5 秒 RPC 链。现在注册前先注销上一条，并加上「DOM 已离开文档就自动注销」的保护。
+- **停机可能被 SIGKILL、状态不刷新且残留 `watch.pid`**：守护可能正阻塞在 `wget -T 8/12` 上，procd 默认约 5 秒停机超时会在 TERM trap 执行前 SIGKILL。现在两个 procd 实例都设置 `term_timeout 20`；`do_wake` 发信号前先核对 `/proc/<pid>/cmdline`，避免过期 PID 复用后误杀无关进程。
+- **apk 卸载后内核阻断表残留**：被「断开」的设备会一直被 `bridge drcom_block` 丢弃，且没有界面可解除。现在 `prerm` 里会删除该 nft 表；并仅在真正卸载（非升级，用 OpenWrt 通用的 `PKG_UPGRADE` 判定）时清理 `/etc/drcom.blocked`、`/etc/drcom.paused`。
+- **`state.tmp` 固定文件名并发写**：守护与手动动作可能同时写同一个临时文件，可能把半截内容 rename 成 `state` 并被 rpcd `source`。改为按 PID 命名，并顺手清理历史遗留的固定名临时文件。
+- **双上行时填错 `wlan_user_ip`**：`uplink=auto` 可能在 `wwan`/`wan` 都有 IP 时选了 `wwan`，而实际出网走 `wan`，导致 ePortal 报「IP 不一致」。现在登录时以当前默认路由的源地址（`ip route get`）填 `wlan_user_ip`，取不到再退回接口地址。
+- **解除阻断忽略 nft 下发失败**：`unkick` 不检查 `nft_sync_blocks` 返回值，失败时仍回「已解除」。现在会回显错误并把 MAC 放回名单，避免「界面说解除了、实际还在拦」。
+- **MAC 校验过宽、坏记录会毒化整份名单**：`read_params` 之前只挡非法字符，`aa`、`::` 也能通过；写进 `/etc/drcom.blocked` 后会让每次 `nft -f` 事务整体失败。现在只接受标准 6 段 MAC，并在下发时逐行校验、跳过坏行。
+- **设备列表每 5 秒整块重建 DOM**：内容没变时不再重建（按排序后的设备签名判断），避免列表抖动和按钮焦点丢失。
+- **「刷新」按钮绕过刷新串行化**：设备区的「刷新」改为走统一的 `refresh(true)`，不再与轮询并发各跑一套探测/RPC。
+- **总开关在状态读取失败时保持乐观状态**：现在状态获取失败会禁用切换按钮，下次成功读取后恢复；「状态更新」改为更易读的相对时间，「最多 60 秒生效」的写死文案改为不依赖具体间隔的表述。
+- **前后端一致性**：`do_login` / 守护的空账号判断改用 `USERNAME`（不再被运营商后缀拼出的 `@dx` 骗过）；登录成功判定兼容 `"result": 1` 这类带空格的写法；`status` 的账号显示也用 `USERNAME`。
+- **设备列表日志/状态目录权限**：rpcd 后端补 `umask 077` 并在建目录时 `chmod 700`；日志临时文件从可预测的 `/tmp/.drcom-log.$$` 改到仅 root 可读的 `$STATE_DIR`（`mktemp` + 0600）。
+- **`block_purge` 与 kick/unkick 并发**：`block_purge` 现在也拿 `flock`，避免 devwatch 用旧快照覆盖刚发生的阻断/解除。
+- **设备存活判定**：优先读 `watch.pid` 并校验 `/proc/<pid>/cmdline`，`pgrep` 只作兜底，降低每次 `status` 全表扫描的开销。
+- **热插拔的启用判断**：`enabled` 选项缺失时按「启用」处理，与 `drcom-portal` 的 `config_get_bool` 默认值一致。
+- **安装/卸载脚本**：`install.sh` 关键步骤加失败提示、检查可选依赖；`uninstall.sh` 补 root 检查并判断 `nft` 是否存在。
+- **打包与 CI**：`DEPENDS` 补 `luci-base` / `nftables` / `jsonfilter`；CI 只挑 `luci-app-drcom-*.apk`（不再可能挂错包），并校验 tag 与 `PKG_VERSION` 一致；`tar.gz` 改用固定 `mtime` 的 gzip 头，真的可复现；lint 增加 `tools/*.py` 语法检查；`postinst` 升级时不再重新启用管理员手动 `disable` 的服务。
+
+### 未改动（有意保留）
+
+- devwatch 的 5 秒探测频率与「先 flush 邻居项再 ping」的判定方式：这是准确判断有线设备上下线的关键，改动会影响「拔线后几秒内消失」的现有行为，故保留。
+
+---
+
 ## v1.0.13 — 2026-11-22
 
 ### 修复

@@ -36,7 +36,8 @@ def main():
     # 每个版本以 "## vX.Y.Z — 日期" 开头
     for block in re.split(r'^##\s+', text, flags=re.M)[1:]:
         header, _, body = block.partition('\n')
-        m = re.match(r'v(\S+)', header.strip())
+        # 容忍 "v1.0.2" / "[v1.0.2]" / "1.0.2" 等标题写法
+        m = re.match(r'\[?v?(\d[\w.\-]*)\]?', header.strip())
         if m and m.group(1) == version:
             # 去掉段落末尾用于分隔下一版的那条 ---（Release 正文里不需要）
             body = re.sub(r'\s*\n-{3,}\s*$', '', body.strip()).strip()

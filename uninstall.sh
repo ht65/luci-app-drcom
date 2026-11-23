@@ -7,6 +7,8 @@
 
 set -e
 
+[ "$(id -u)" = "0" ] || { echo "错误：需要 root 权限"; exit 1; }
+
 echo "==> 停止服务"
 /etc/init.d/drcom stop >/dev/null 2>&1 || true
 /etc/init.d/drcom disable >/dev/null 2>&1 || true
@@ -26,8 +28,10 @@ echo "==> 清理运行时状态"
 rm -rf /var/run/drcom
 rm -f /etc/drcom.paused
 rm -f /etc/drcom.blocked
-# 设备阻断用的 nft 表
-nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
+# 设备阻断用的 nft 表（内核状态，不属于任何文件，必须主动删）
+if command -v nft >/dev/null 2>&1; then
+	nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
+fi
 
 if [ "$1" = "--purge" ]; then
 	echo "==> 删除配置"

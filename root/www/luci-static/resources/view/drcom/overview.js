@@ -30,6 +30,11 @@ var TERM_NAMES = {
 // 状态 5 秒一轮；日志与设备列表每 3 轮（15 秒）拉一次，减少无谓开销
 var SLOW_EVERY = 3;
 
+// LuCI 的 poll 回调不会随视图切换自动注销。本文件每次 render() 都会生成
+// 新的 refresh 闭包，若不在重新渲染前移除旧的，反复进页面会累积成多条
+// 5 秒 RPC 链（并让旧 DOM 一直无法回收）。这里保存上一次注册的函数句柄。
+var lastPollFn = null;
+
 // 布局：统一卡片内边距、行高与卡片间距，紧凑但不拥挤
 var CSS = [
 	// 卡片与标题
@@ -61,7 +66,6 @@ var CSS = [
 	'.drcom-dev-name{flex:1 1 130px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 	'.drcom-dev-ip{flex:0 0 auto;opacity:.8;font-variant-numeric:tabular-nums}',
 	'.drcom-dev-mac{flex:0 0 auto;opacity:.5;font-size:11px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}',
-	'.drcom-dev-away{opacity:.45}',
 	'.drcom-dev-count{font-size:12px;opacity:.65}',
 	// 总开关停用时置灰
 	'.drcom-off .cbi-button,.drcom-off .drcom-tab{opacity:.45;pointer-events:none}',
@@ -203,7 +207,9 @@ return view.extend({
 			vTerm.textContent    = TERM_NAMES[String(s.terminal)] || '—';
 
 			var age = parseInt(s.age);
-			vAge.textContent = (isNaN(age) || age < 0) ? '—' : (age + ' 秒前');
+			vAge.textContent = (isNaN(age) || age < 0)
+				? '—'
+				: relTime(Math.floor(Date.now() / 1000) - age);
 
 			vError.textContent = s.last_error
 				? (s.last_error + (fails > 1 ? '（已连续失败 ' + fails + ' 次）' : ''))
@@ -221,10 +227,11 @@ return view.extend({
 			var fm = parseInt(s.fail_max);
 			if (!isNaN(fm) && fm > 0)
 				failMax = fm;
-			failHint.textContent = '修改后保存，最多 60 秒自动生效；需要立刻生效请点上方「重启服务」。'
+			failHint.textContent = '修改后保存，下一轮在线检测时自动生效（更快请点上方「重启服务」）。'
 				+ '连续失败 ' + failMax + ' 次后会自动暂停重试，避免账号被风控。';
 
 			masterOn = enabled;
+			masterBtn.disabled = false;	// 之前若因状态读取失败被禁用，现在恢复
 			setMasterUi();
 		}
 
@@ -281,6 +288,7 @@ return view.extend({
 		// 目的：点「断开/解除」时先乐观重绘（点击即反应），并在这之后的几秒内
 		// 忽略「读缓存」的旧设备响应，避免 devwatch 还没刷新时把界面又改回去。
 		var lastDevices = null;
+		var lastDevSig = null;	// 上一次已渲染的设备列表签名，内容没变就不重建 DOM
 		var devSeq = 0, devAppliedSeq = 0, devHoldUntil = 0;
 
 		// 立刻把某台设备按「已阻断 / 已解除」重绘，不等后端往返。
@@ -324,6 +332,23 @@ return view.extend({
 				return parseInt(x.online) == 1 || parseInt(x.blocked) == 1;
 			});
 
+			// 在线的排前面，阻断的排后面。先排序再算签名，避免探测顺序抖动
+			// 导致每轮都误判为「有变化」而整块重建。
+			list.sort(function(a, b) {
+				var sa = (parseInt(a.online) || 0) * 2 + (parseInt(a.blocked) || 0);
+				var sb = (parseInt(b.online) || 0) * 2 + (parseInt(b.blocked) || 0);
+				return sb - sa;
+			});
+
+			// 内容没变就不重建：每 5 秒轮询都会拿到一份全新对象，无条件重建
+			// 会让设备行抖动，并打断正在点的「断开 / 解除」按钮。
+			var sig = list.map(function(x) {
+				return [x.mac, x.ip, x.online, x.blocked, x.wireless, x.name].join('|');
+			}).join(';');
+			if (sig === lastDevSig)
+				return;
+			lastDevSig = sig;
+
 			while (devList.firstChild)
 				devList.removeChild(devList.firstChild);
 
@@ -342,31 +367,19 @@ return view.extend({
 			});
 			devCount.textContent = online + ' 台在线' + (blocked ? ' · ' + blocked + ' 台已阻断' : '');
 
-			// 在线的排前面，阻断的排后面
-			list.sort(function(a, b) {
-				var sa = (parseInt(a.online) || 0) * 2 + (parseInt(a.blocked) || 0);
-				var sb = (parseInt(b.online) || 0) * 2 + (parseInt(b.blocked) || 0);
-				return sb - sa;
-			});
-
 			list.forEach(function(x) {
-				var on = parseInt(x.online) == 1;
 				var wifi = parseInt(x.wireless) == 1;
 				var blocked = parseInt(x.blocked) == 1;
-				var seen = parseInt(x.last_seen) || 0;
 
+				// 列表只保留「在线 / 已阻断」两种，不会再出现离线的行
 				var statusText, statusCls;
 				if (blocked) {
 					statusText = '已阻断';
 					statusCls = 'drcom-tag drcom-tag-block';
 				}
-				else if (on) {
+				else {
 					statusText = '在线';
 					statusCls = 'drcom-tag drcom-tag-on';
-				}
-				else {
-					statusText = seen > 0 ? ('离线 · ' + relTime(seen)) : '离线';
-					statusCls = 'drcom-tag';
 				}
 
 				var actBtn = blocked
@@ -383,7 +396,7 @@ return view.extend({
 				});
 
 				devList.appendChild(E('div', {
-					'class': 'drcom-dev' + ((!on && !blocked) ? ' drcom-dev-away' : '')
+					'class': 'drcom-dev'
 				}, [
 					E('span', { 'class': 'drcom-dev-name' }, x.name || '未知设备'),
 					E('span', { 'class': 'drcom-dev-ip' }, x.ip || '—'),
@@ -412,11 +425,15 @@ return view.extend({
 			}).catch(function() {
 				badge.textContent = '状态获取失败';
 				badge.style.background = '#c62828';
+				// 拿不到真实启用状态时，别让总开关保持乐观的「运行中 / 停用插件」
+				masterBtn.disabled = true;
 			}).then(function() {
 				// 设备列表读的是后端缓存（后台每 5 秒刷新），响应很快，所以每轮都拉；
 				// 日志要读 80 行、比较慢，仍每 3 轮（15 秒）拉一次。
 				// 手动刷新（force）时让后端跳过缓存、现场探测一次，拔线/插线立刻反映
 				return loadDevices(force === true).catch(function() {
+					// 清掉签名，保证下一次成功的结果一定会重绘，把这条错误提示替换掉
+					lastDevSig = null;
 					while (devList.firstChild)
 						devList.removeChild(devList.firstChild);
 					devCount.textContent = '读取失败';
@@ -508,8 +525,9 @@ return view.extend({
 		devReload.addEventListener('click', function(ev) {
 			ev.preventDefault();
 			devReload.disabled = true;
-			// 直接强制现场探测并刷新，不排在轮询刷新后面
-			loadDevices(true).catch(function() {}).finally(function() { devReload.disabled = false; });
+			// 走统一的刷新链（force 会让后端跳过缓存、现场探测一次），
+			// 避免和轮询同时各跑一套探测 / RPC。
+			refresh(true).catch(function() {}).finally(function() { devReload.disabled = false; });
 		});
 
 		devicesBox = section([
@@ -622,7 +640,37 @@ return view.extend({
 		o.datatype = 'port';
 		o.placeholder = '801';
 
-		poll.add(refresh, 5);
+		o = s.option(form.Value, 'probe_url', _('连通性检测地址'),
+			_('只有该地址返回的内容等于下面的「期望内容」时才判定已认证。换学校若门户劫持方式不同，可改这里。'));
+		o.placeholder = 'http://www.msftconnecttest.com/connecttest.txt';
+
+		o = s.option(form.Value, 'probe_expect', _('期望返回内容'),
+			_('与检测地址的响应正文完全一致才算在线（区分大小写）。'));
+		o.placeholder = 'Microsoft Connect Test';
+
+		// LuCI 的 poll 回调不会随视图切换自动注销。这里用带「DOM 是否还在文档里」
+		// 检查的包装函数：离开页面后自动注销；同时先移除上一次注册的，
+		// 避免反复进页面累积成多条 5 秒 RPC 链。
+		// pollAttached 用于避免「视图还没挂到文档上」的极短窗口里误注销。
+		var pollAttached = false;
+		function pollTick() {
+			var inDoc = document.body.contains(logBox);
+
+			if (inDoc) {
+				pollAttached = true;
+			}
+			else if (pollAttached && typeof poll.remove == 'function') {
+				poll.remove(pollTick);
+				return;
+			}
+
+			refresh(false);
+		}
+
+		if (lastPollFn && typeof poll.remove == 'function')
+			poll.remove(lastPollFn);
+		lastPollFn = pollTick;
+		poll.add(pollTick, 5);
 		poll.start();
 		refresh(true);
 

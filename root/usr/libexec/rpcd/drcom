@@ -7,6 +7,13 @@ STATE_DIR=/var/run/drcom
 META="$STATE_DIR/devmeta"	# mac type last_seen（记住设备是有线还是无线）
 BLOCK=/etc/drcom.blocked	# 每行一个 MAC；只要不解除就一直阻断（关闭插件时清空）
 
+# 状态目录里有账号、IP 等，统一收紧权限（rpcd 可能先于守护创建目录）
+umask 077
+ensure_state_dir() {
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	chmod 700 "$STATE_DIR" 2>/dev/null
+}
+
 # 取 uci 值；缺失时用和 drcom-portal 一致的默认值，
 # 避免界面显示（例如「已禁用」）与运行时实际行为对不上。
 cfg() {
@@ -79,7 +86,7 @@ nft_table_init() {
 # 下发用一个 nft -f 事务完成，原子生效。
 nft_sync_blocks() {
 	local sig
-	mkdir -p "$STATE_DIR" 2>/dev/null
+	ensure_state_dir
 	if [ ! -s "$BLOCK" ]; then
 		nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
 		rm -f "$NFT_SIG" 2>/dev/null
@@ -94,7 +101,13 @@ nft_sync_blocks() {
 	{
 		echo "flush set bridge drcom_block blocked"
 		while read -r mac; do
-			[ -n "$mac" ] && echo "add element bridge drcom_block blocked { $mac }"
+			# 只放行标准 6 段 MAC：一行坏数据会让整个 nft 事务失败，
+			# 进而使之后所有阻断/解除都失效（名单被"毒化"）。
+			case "$mac" in
+				[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+					echo "add element bridge drcom_block blocked { $mac }"
+					;;
+			esac
 		done < "$BLOCK"
 	} | nft -f - 2>"$STATE_DIR/.nfterr"
 	if [ $? -ne 0 ]; then
@@ -111,8 +124,11 @@ nft_sync_blocks() {
 	return 0
 }
 
-# 兼容旧调用：现在没有过期时间，只剩「把文件里的 MAC 同步到内核」
+# 兼容旧调用：现在没有过期时间，只剩「把文件里的 MAC 同步到内核」。
+# devwatch 每轮都会走到这里，必须和 kick/unkick 的「读改写」串行，
+# 否则可能拿到旧快照，把刚解除的 MAC 又加回去（或漏掉刚阻断的）。
 block_purge() {
+	block_lock
 	nft_sync_blocks
 }
 
@@ -123,11 +139,28 @@ is_blocked() {
 
 # ---------- 状态 ----------
 
+# 守护进程存活判定：优先读 pidfile，并核对 /proc/<pid>/cmdline 防止 PID 复用；
+# 都没有（老状态目录）时退回 pgrep。比每次 status 都全表 pgrep 便宜。
+daemon_running() {
+	local pid
+	pid=$(cat "$STATE_DIR/watch.pid" 2>/dev/null)
+	case "$pid" in
+		''|*[!0-9]*) ;;
+		*)
+			if kill -0 "$pid" 2>/dev/null \
+			   && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'drcom-portal'; then
+				return 0
+			fi
+			;;
+	esac
+	pgrep -f "drcom-portal watch" >/dev/null 2>&1
+}
+
 method_status() {
 	local running=0 online=0 paused=0 hold=0 fails=0 ip="" uplink="" account=""
 	local stamp=0 age=-1 port ser term configured=0 enabled=1 last_error="" fail_max=5
 
-	pgrep -f "drcom-portal watch" >/dev/null 2>&1 && running=1
+	daemon_running && running=1
 
 	[ -f "$STATE" ] && . "$STATE"
 	[ "$stamp" -gt 0 ] 2>/dev/null && age=$(( $(date +%s) - stamp ))
@@ -167,23 +200,28 @@ method_status() {
 # ---------- 日志（自动认证 / 手动操作分开） ----------
 
 method_log() {
-	local pat
+	local pat tmpf
 	case "$1" in
 		op) pat='[操作]' ;;
 		*)  pat='[自动]' ;;
 	esac
 
+	ensure_state_dir
+	# 放到仅 root 可读写的状态目录里，避免 /tmp 下可预测的临时文件被窥读或做软链攻击
+	tmpf=$(mktemp "$STATE_DIR/.drcom-log.XXXXXX" 2>/dev/null) || tmpf="$STATE_DIR/.drcom-log.$$"
+	chmod 600 "$tmpf" 2>/dev/null
+
 	# 老版本启动日志末尾带「（连续失败 N 次后暂停自动重试）」，这句提示已经挪到界面里，显示时去掉
 	logread -e drcom 2>/dev/null | grep -F "$pat" \
 		| sed 's/（连续失败 [0-9][0-9]* 次后暂停自动重试）//' \
-		| tail -n 80 > /tmp/.drcom-log.$$
+		| tail -n 80 > "$tmpf"
 	json_init
 	json_add_array lines
 	while IFS= read -r line; do
 		json_add_string "" "$line"
-	done < /tmp/.drcom-log.$$
+	done < "$tmpf"
 	json_close_array
-	rm -f /tmp/.drcom-log.$$
+	rm -f "$tmpf" 2>/dev/null
 	json_dump
 }
 
@@ -232,7 +270,7 @@ collect_devices() {
 	now=$(date +%s)
 	landev=$(uci -q get network.lan.device)
 	[ -n "$landev" ] || landev=br-lan
-	mkdir -p "$STATE_DIR" 2>/dev/null
+	ensure_state_dir
 
 	block_purge
 	list_stations > "$wl"
@@ -370,7 +408,7 @@ collect_devices() {
 
 # 探测一次并写缓存（由后台 devwatch 调用）
 dev_probe_cache() {
-	mkdir -p "$STATE_DIR" 2>/dev/null
+	ensure_state_dir
 	collect_devices > "$DEVCACHE.tmp.$$" 2>/dev/null
 	if [ -s "$DEVCACHE.tmp.$$" ]; then
 		mv "$DEVCACHE.tmp.$$" "$DEVCACHE"
@@ -414,14 +452,18 @@ read_params() {
 	IFS= read -r req 2>/dev/null
 	P_MAC=$(printf '%s' "$req" | jsonfilter -e '@.mac' 2>/dev/null | tr 'A-F' 'a-f')
 	P_IP=$(printf '%s' "$req" | jsonfilter -e '@.ip' 2>/dev/null)
+	# 必须是标准 6 段 MAC：只挡非 [0-9a-f:] 字符不够（"aa"、"::" 也能通过），
+	# 而坏 MAC 一旦写进阻断名单，会让之后所有 nft 事务都失败。
 	case "$P_MAC" in
-		''|*[!0-9a-f:]*) return 1 ;;
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) P_MAC=""; P_IP=""; return 1 ;;
 	esac
 	return 0
 }
 
 # 名单读改写要串行（rpcd 不保证同一插件的调用顺序），用 flock 锁住
 block_lock() {
+	ensure_state_dir
 	command -v flock >/dev/null 2>&1 || return 0
 	exec 9>"$STATE_DIR/.block.lock" 2>/dev/null || return 0
 	flock 9
@@ -467,7 +509,7 @@ method_kick() {
 	mac="$P_MAC"
 	ip=$(valid_ipv4 "$P_IP")
 
-	mkdir -p "$STATE_DIR" 2>/dev/null
+	ensure_state_dir
 	block_lock
 
 	# 1) 先落阻断规则（只丢单播，广播放行，设备还能 DHCP / 保持关联）
@@ -499,11 +541,11 @@ method_kick() {
 }
 
 method_unkick() {
-	local mac tmp
+	local mac tmp rc
 	read_params || { json_init; json_add_string message "无效的 MAC 地址"; json_dump; return; }
 	mac="$P_MAC"
 
-	mkdir -p "$STATE_DIR" 2>/dev/null
+	ensure_state_dir
 	block_lock
 
 	tmp="$BLOCK.tmp.$$"
@@ -517,6 +559,18 @@ method_unkick() {
 		rm -f "$tmp" "$BLOCK"
 	fi
 	nft_sync_blocks
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		# 下发失败：把 MAC 放回名单，让文件状态与「内核里仍在阻断」一致，
+		# 下一轮探测会再次尝试同步，避免「界面说已解除、实际还在拦」。
+		printf '%s\n' "$mac" >> "$BLOCK" 2>/dev/null
+		chmod 600 "$BLOCK" 2>/dev/null
+		logger -t drcom-portal "[操作] 解除设备 $mac 失败：$NFT_ERR" 2>/dev/null
+		json_init
+		json_add_string message "$NFT_ERR"
+		json_dump
+		return
+	fi
 	logger -t drcom-portal "[操作] 已解除设备 $mac 的阻断" 2>/dev/null
 
 	json_init
@@ -540,7 +594,7 @@ method_action() {
 # 总开关：整插件启用/停用。停用后守护进程不运行、不探测、不认证、不动上行接口，
 # 方便接 USB CPE 等其它上行时避免两边互相抢。
 method_master() {
-	mkdir -p "$STATE_DIR" 2>/dev/null
+	ensure_state_dir
 
 	if [ "$1" = "on" ]; then
 		uci -q set drcom.main.enabled='1'

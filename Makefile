@@ -30,7 +30,7 @@ define Package/luci-app-drcom
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Dr.COM 校园网 Portal 认证
-  DEPENDS:=+rpcd +conntrack +kmod-nft-bridge +iw
+  DEPENDS:=+rpcd +nftables +kmod-nft-bridge +iw +jsonfilter +conntrack
   PKGARCH:=all
 endef
 
@@ -66,18 +66,27 @@ define Package/luci-app-drcom/postinst
 	cp /usr/share/drcom/config.default /etc/config/drcom
 	chmod 600 /etc/config/drcom
 }
-/etc/init.d/drcom enable
+# 升级时不要重新启用管理员手动 disable 过的服务；新装默认启用。
+# 注：维护脚本会被 make 展开，shell 变量必须写成 $$VAR；
+# 升级判定用 OpenWrt 通用的 PKG_UPGRADE（opkg / apk 都会在升级时设置）。
+[ "$${PKG_UPGRADE:-0}" = "1" ] || /etc/init.d/drcom enable
 /etc/init.d/drcom restart
 /etc/init.d/rpcd restart
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 exit 0
 endef
 
-# 停止服务必须放在 prerm：postrm 执行时文件已经删掉了，/etc/init.d/drcom 不存在
+# 停止服务必须放在 prerm：postrm 执行时文件已经删掉了，/etc/init.d/drcom 不存在。
+# 设备阻断是内核状态，不是包内文件，卸载/升级都必须自己清掉，否则被断的设备会一直黑洞。
 define Package/luci-app-drcom/prerm
 #!/bin/sh
 /etc/init.d/drcom stop
 /etc/init.d/drcom disable
+command -v nft >/dev/null 2>&1 && nft list table bridge drcom_block >/dev/null 2>&1 && nft delete table bridge drcom_block 2>/dev/null
+# 仅真正卸载时清理运行时状态；升级要保留用户的阻断名单与「已下线」标记
+if [ "$${PKG_UPGRADE:-0}" != "1" ]; then
+	rm -f /etc/drcom.blocked /etc/drcom.paused
+fi
 exit 0
 endef
 
