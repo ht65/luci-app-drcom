@@ -4,9 +4,9 @@
 
 ---
 
-## 未发布 — 2026-11-23
+## v1.0.14 — 2026-11-23
 
-> 本次为代码审查后的修复，尚未发版（`Makefile` 的 `PKG_VERSION` 保持 1.0.13，发版时再按流程提升版本号）。
+> 本次为代码审查后的修复，已在 Cudy TR3000 v1 / ImmortalWrt 25.12.2 实机验证（安装、状态、设备列表、断开/解除、总开关、上下线、卸载脚本共 20 项全部通过）。
 
 ### 修复
 
@@ -27,7 +27,8 @@
 - **设备存活判定**：优先读 `watch.pid` 并校验 `/proc/<pid>/cmdline`，`pgrep` 只作兜底，降低每次 `status` 全表扫描的开销。
 - **热插拔的启用判断**：`enabled` 选项缺失时按「启用」处理，与 `drcom-portal` 的 `config_get_bool` 默认值一致。
 - **安装/卸载脚本**：`install.sh` 关键步骤加失败提示、检查可选依赖；`uninstall.sh` 补 root 检查并判断 `nft` 是否存在。
-- **打包与 CI**：`DEPENDS` 补 `luci-base` / `nftables` / `jsonfilter`；CI 只挑 `luci-app-drcom-*.apk`（不再可能挂错包），并校验 tag 与 `PKG_VERSION` 一致；`tar.gz` 改用固定 `mtime` 的 gzip 头，真的可复现；lint 增加 `tools/*.py` 语法检查；`postinst` 升级时不再重新启用管理员手动 `disable` 的服务。
+- **卸载后可能残留 `devwatch` 进程**：procd 的 `stop` 是异步的，卸载刚返回时实例可能还阻塞在 `devprobe` 子进程里。现在 `uninstall.sh` 会等待 `watch`/`devwatch` 真正退出（最多 15 秒）再删除文件，仍未退出时给出提示。
+- **打包与 CI**：`DEPENDS` 补 `nftables` / `jsonfilter`（`nft` 用户态命令与 `jsonfilter` 都不是 `rpcd` 自带；为保持「纯 SDK 免 luci feed 可编译」未加 `luci-base`）；CI 只挑 `luci-app-drcom-*.apk`（不再可能挂错包），并校验 tag 与 `PKG_VERSION` 一致；`tar.gz` 改用固定 `mtime` 的 gzip 头，真的可复现；lint 增加 `tools/*.py` 语法检查；`postinst` 升级时不再重新启用管理员手动 `disable` 的服务。
 
 ### 未改动（有意保留）
 

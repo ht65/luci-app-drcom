@@ -13,6 +13,17 @@ echo "==> 停止服务"
 /etc/init.d/drcom stop >/dev/null 2>&1 || true
 /etc/init.d/drcom disable >/dev/null 2>&1 || true
 
+# procd 的 stop 是异步的：实例可能在 TERM 之后还阻塞在当前子进程里（devprobe / wget），
+# 所以这里等一个有限的时间，确保文件删掉之后不会还留着一个 devwatch 在后台跑。
+i=0
+while [ "$i" -lt 15 ] && pgrep -f 'drcom-portal (watch|devwatch)' >/dev/null 2>&1; do
+	sleep 1
+	i=$((i + 1))
+done
+if pgrep -f 'drcom-portal (watch|devwatch)' >/dev/null 2>&1; then
+	echo "    警告：仍有 drcom-portal 进程未退出，可稍后手动 kill"
+fi
+
 echo "==> 删除文件"
 rm -f /etc/init.d/drcom \
       /etc/hotplug.d/iface/95-drcom \
